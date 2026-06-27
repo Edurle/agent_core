@@ -226,3 +226,92 @@ class TestSystemPrompt:
         # 但 memory 里不含 system
         memory_msgs = memory.load()
         assert all(m.role != Role.SYSTEM for m in memory_msgs)
+
+
+# ── tool_call 配对校验 ────────────────────────────────────
+
+
+class TestToolCallPairingValidation:
+    """校验 _validate_tool_call_pairing 拦截破坏配对的 Memory。"""
+
+    def test_valid_pairing_passes(self):
+        """完整配对的历史通过校验。"""
+        from agent_core.agent import _validate_tool_call_pairing
+        from agent_core.messages import ToolCall
+        msgs = [
+            Message(role=Role.USER, content="hi"),
+            Message(role=Role.ASSISTANT, tool_calls=[
+                ToolCall(id="c1", name="add", arguments={"a": 1}),
+            ]),
+            Message(role=Role.TOOL, content="1", tool_call_id="c1", name="add"),
+            Message(role=Role.ASSISTANT, content="结果1"),
+        ]
+        _validate_tool_call_pairing(msgs)   # 不抛异常
+
+    def test_orphan_tool_raises(self):
+        """孤儿 tool 消息（无对应 assistant）报错。"""
+        from agent_core.agent import _validate_tool_call_pairing
+        msgs = [
+            Message(role=Role.USER, content="hi"),
+            Message(role=Role.TOOL, content="24", tool_call_id="orphan", name="add"),
+        ]
+        with pytest.raises(ValueError, match="找不到对应的 assistant"):
+            _validate_tool_call_pairing(msgs)
+
+    def test_orphan_assistant_tool_calls_raises(self):
+        """assistant 发起 tool_calls 后，下一条又是 assistant（未回填）报错。"""
+        from agent_core.agent import _validate_tool_call_pairing
+        from agent_core.messages import ToolCall
+        msgs = [
+            Message(role=Role.ASSISTANT, tool_calls=[
+                ToolCall(id="c1", name="add", arguments={}),
+            ]),
+            # 缺 tool 回填，直接又来 assistant
+            Message(role=Role.ASSISTANT, content="跳过了"),
+        ]
+        with pytest.raises(ValueError, match="未回填的 tool_call_id"):
+            _validate_tool_call_pairing(msgs)
+
+    def test_broken_memory_caught_in_agent(self, make_llm):
+        """模拟摘要型 Memory 拆散配对，Agent 在 LLM 调用前拦截。"""
+        from agent_core.messages import ToolCall
+
+        class BrokenSummaryMemory:
+            """故意破坏：丢弃 assistant(含tool_calls) 但保留它的 tool 结果。"""
+            def __init__(self):
+                self._msgs = [
+                    # 模拟摘要后残留：孤儿 tool 消息
+                    Message(role=Role.TOOL, content="24", tool_call_id="lost", name="add"),
+                ]
+            def load(self):
+                return list(self._msgs)
+            def add(self, m):
+                self._msgs.append(m)
+
+        agent = Agent(llm=make_llm(["x"]), memory=BrokenSummaryMemory(), max_iterations=5)
+        with pytest.raises(ValueError, match="找不到对应的 assistant"):
+            agent.invoke("hi")
+
+    def test_proper_grouped_memory_passes(self, make_llm):
+        """正确实现：整组保留 assistant+tool，校验通过。"""
+        from agent_core.messages import ToolCall
+
+        class GoodGroupMemory:
+            """整组保留（assistant+其tool 一起）。"""
+            def __init__(self):
+                self._msgs = [
+                    Message(role=Role.ASSISTANT, tool_calls=[
+                        ToolCall(id="c1", name="add", arguments={}),
+                    ]),
+                    Message(role=Role.TOOL, content="5", tool_call_id="c1", name="add"),
+                ]
+            def load(self):
+                return list(self._msgs)
+            def add(self, m):
+                self._msgs.append(m)
+
+        agent = Agent(llm=make_llm(["ok"]), memory=GoodGroupMemory(), max_iterations=5)
+        # 校验通过，正常返回（LLM 脚本只够1轮，第1轮就给答案）
+        result = agent.invoke("继续")
+        assert result == "ok"
+

@@ -179,11 +179,13 @@ class Agent:
         """组装发给 LLM 的消息：system_prompt + memory.load()。
 
         system_prompt 不进 memory（由 Agent 单独管理），每次拼到最前。
+        组装后校验 tool_call 配对完整性（破坏时抛清晰错误，避免 OpenAI API 报难懂的错）。
         """
         messages: list[Message] = []
         if self.system_prompt:
             messages.append(Message(role=Role.SYSTEM, content=self.system_prompt))
         messages.extend(self.memory.load())
+        _validate_tool_call_pairing(messages)
         return messages
 
     @property
@@ -467,6 +469,44 @@ def _tool_msg(result: str, call) -> Message:
         tool_call_id=call.id,
         name=call.name,
     )
+
+
+def _validate_tool_call_pairing(messages: list[Message]) -> None:
+    """校验消息历史的 tool_call 配对完整性（OpenAI API 硬性约束）。
+
+    规则：每条带 tool_calls 的 assistant 消息，其后必须紧跟所有对应的
+    role=tool 结果消息（用 tool_call_id 配对），不能拆散、不能缺失、不能乱序。
+    破坏时抛 ValueError，给出清晰提示（避免让 OpenAI API 报难懂的错）。
+
+    这条校验主要保护**自定义 Memory 策略**（摘要/激进截断）——它们可能
+    在逐条 add 的间隙把 assistant+tool 组拆散。ListMemory 不会触发。
+    """
+    pending_ids: set[str] = set()   # 当前 assistant 发起、尚未回填的 tool_call id
+    for i, msg in enumerate(messages):
+        if msg.role == Role.ASSISTANT:
+            # 任何 assistant 出现时，上一轮的 tool_call 必须已全部回填
+            if pending_ids:
+                raise ValueError(
+                    f"消息历史 tool_call 配对断裂：第 {i} 条 assistant 消息前，"
+                    f"仍有未回填的 tool_call_id={sorted(pending_ids)}。"
+                    f"自定义 Memory 策略（摘要/截断）可能拆散了 assistant+tool 组——"
+                    f"丢弃消息时必须整组丢弃。"
+                )
+            # 本条 assistant 若发起 tool_calls，登记待回填
+            if msg.tool_calls:
+                pending_ids = {tc.id for tc in msg.tool_calls}
+        elif msg.role == Role.TOOL:
+            if not pending_ids:
+                raise ValueError(
+                    f"消息历史 tool_call 配对断裂：第 {i} 条 tool 消息"
+                    f"(tool_call_id={msg.tool_call_id}) 找不到对应的 assistant tool_calls。"
+                    f"自定义 Memory 策略可能丢弃了 assistant 消息却保留了它的 tool 结果。"
+                )
+            if msg.tool_call_id in pending_ids:
+                pending_ids.discard(msg.tool_call_id)
+            # tool_call_id 不在 pending 里：可能是重复/孤儿，忽略（OpenAI 会自己报）
+    # 末尾若有未回填的 tool_call（assistant 发起后无 tool 结果），交给上层判断
+    # （可能是正常的中途状态，如最后一条就是要调工具的 assistant——但那不会进 memory）
 
 
 def _collect_stream_final(event_iter: Iterator[StreamEvent]) -> Iterator[StreamEvent]:

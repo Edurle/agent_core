@@ -41,6 +41,18 @@ class Memory(Protocol):
     多用户场景：每个用户/会话一个 Memory 实例（B 方案隔离）。
 
     system_prompt 不进 Memory——Agent 单独管理，每次拼到 load() 结果最前。
+
+    ⚠️ **自定义实现的硬性约束（tool_call 配对完整性）**：
+    ``load()`` 返回的消息历史**必须**保持 OpenAI tool_call 配对完整——
+    每条带 ``tool_calls`` 的 assistant 消息后，必须紧跟其所有 ``role=tool``
+    结果消息（用 ``tool_call_id`` 配对），不能拆散、不能缺失。
+
+    原因：框架 ``add`` 是逐条触发的（assistant 一条、tool 每个一条），摘要/激进
+    截断策略若在 add 间隙压缩，可能把 "assistant(含tool_calls) + 它的 tool结果"
+    这个不可分割的组拆散，导致孤儿 tool 消息 → OpenAI API 报错。
+
+    **对策**：丢弃/压缩消息时，必须**整组丢弃**（assistant + 其所有 tool 结果一起）。
+    Agent 在每次 LLM 调用前会校验配对完整性，破坏时抛清晰错误（而非让 API 报错）。
     """
 
     def load(self) -> list[Message]:
