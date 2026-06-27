@@ -72,7 +72,8 @@ secrets.json
 .DS_Store
 Thumbs.db
 
-# --- Project local data ---
+# --- Project local data / runtime logs ---
 data/
 logs/
+run.log          # 多模型测试运行日志（含 LLM 调用记录，不入库）
 *.log
