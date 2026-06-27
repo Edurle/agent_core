@@ -137,10 +137,17 @@ class Tool:
 
 
 class ToolRegistry:
-    """工具注册表。维护 name -> Tool 映射。"""
+    """工具注册表。维护 name -> Tool 映射。
 
-    def __init__(self) -> None:
+    可选 ``hooks`` 用于触发工具层事件（on_tool_start/end/error）。
+    通常由 Agent 自动注入（构造 Agent 时若 tools 无 hooks 则共享 Agent 的 hooks）。
+    """
+
+    def __init__(self, hooks: list | None = None) -> None:
         self._tools: dict[str, Tool] = {}
+        # 延迟导入避免循环依赖
+        from .hook import HookRegistry
+        self.hooks = HookRegistry(hooks)
 
     def register(self, tool: Tool) -> Tool:
         """注册一个工具，返回该工具以便链式调用。重名报错。"""
@@ -168,12 +175,26 @@ class ToolRegistry:
 
         工具执行出错时返回错误字符串而非抛异常，
         让 LLM 看到错误后有机会修正参数或换工具重试。
+        触发 on_tool_start → on_tool_end/on_tool_error 事件。
         """
+        from .hook import ToolEndEvent, ToolErrorEvent, ToolStartEvent
+        import time as _time
+
         tool = self.get(name)
+        self.hooks.emit(ToolStartEvent(type="on_tool_start", name=name, arguments=arguments))
+        t0 = _time.time()
         try:
-            return tool.run(**arguments)
+            result = tool.run(**arguments)
+            self.hooks.emit(ToolEndEvent(
+                type="on_tool_end", name=name, result=result, duration=_time.time() - t0
+            ))
+            return result
         except Exception as e:  # noqa: BLE001 - 故意宽泛，错误要回传给 LLM
-            return f"[工具执行错误: {type(e).__name__}: {e}]"
+            err = f"[工具执行错误: {type(e).__name__}: {e}]"
+            self.hooks.emit(ToolErrorEvent(
+                type="on_tool_error", name=name, arguments=arguments, error=str(e)
+            ))
+            return err
 
     def execute_call(self, call: ToolCall) -> str:
         """执行一个 ToolCall（agent 循环的便捷入口）。"""
@@ -187,12 +208,26 @@ class ToolRegistry:
         - 同步函数工具：acall 内部丢线程池（asyncio.to_thread），避免阻塞事件循环。
 
         工具异常被捕获返回错误字符串（ReAct 语义，与 execute 一致）。
+        触发 on_tool_start → on_tool_end/on_tool_error 事件。
         """
+        from .hook import ToolEndEvent, ToolErrorEvent, ToolStartEvent
+        import time as _time
+
         tool = self.get(name)
+        await self.hooks.aemit(ToolStartEvent(type="on_tool_start", name=name, arguments=arguments))
+        t0 = _time.time()
         try:
-            return await tool.acall(**arguments)
+            result = await tool.acall(**arguments)
+            await self.hooks.aemit(ToolEndEvent(
+                type="on_tool_end", name=name, result=result, duration=_time.time() - t0
+            ))
+            return result
         except Exception as e:  # noqa: BLE001
-            return f"[工具执行错误: {type(e).__name__}: {e}]"
+            err = f"[工具执行错误: {type(e).__name__}: {e}]"
+            await self.hooks.aemit(ToolErrorEvent(
+                type="on_tool_error", name=name, arguments=arguments, error=str(e)
+            ))
+            return err
 
     async def aexecute_many(self, calls: list[ToolCall]) -> list[str]:
         """并行执行多个工具调用（asyncio.gather），返回与 calls 顺序对应的结果列表。"""

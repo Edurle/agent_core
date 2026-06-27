@@ -99,3 +99,4 @@ class StreamEvent:
     call_id: str | None = None
     content: str | None = None
     final: Message | None = None
+    usage: object | None = None   # done 事件携带流式 usage（include_usage 开启时来自尾 chunk）

@@ -33,9 +33,25 @@
 """
 
 from .agent import Agent
+from .hook import (
+    ChainEndEvent,
+    ChainStartEvent,
+    Hook,
+    HookEvent,
+    HookRegistry,
+    LLMEndEvent,
+    LLMErrorEvent,
+    LLMNewTokenEvent,
+    LLMStartEvent,
+    TokenUsage,
+    ToolEndEvent,
+    ToolErrorEvent,
+    ToolStartEvent,
+)
 from .llm import LLM, LLMProtocol
 from .messages import Message, Role, StreamEvent, ToolCall, assistant, system, tool_result, user
 from .tools import Tool, ToolRegistry, tool
+from .trace import Span, Trace, TraceCollector
 
 # MCP 是可选依赖：未安装 mcp SDK 时跳过导出，核心功能不受影响。
 # 用户使用 MCPClient 需先 pip install mcp>=1.2
@@ -65,10 +81,28 @@ __all__ = [
     "tool",
     # Agent（统一：invoke/ainvoke/stream/astream）
     "Agent",
+    # Hook（方案 A，事件回调）
+    "Hook",
+    "HookEvent",
+    "HookRegistry",
+    "TokenUsage",
+    "ChainStartEvent",
+    "ChainEndEvent",
+    "LLMStartEvent",
+    "LLMEndEvent",
+    "LLMNewTokenEvent",
+    "LLMErrorEvent",
+    "ToolStartEvent",
+    "ToolEndEvent",
+    "ToolErrorEvent",
+    # Trace（基于 hook 汇聚）
+    "Span",
+    "Trace",
+    "TraceCollector",
     # MCP（可选）
     "MCPClient",
     "MCPTool",
     "MCPToolInfo",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

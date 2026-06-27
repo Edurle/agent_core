@@ -24,6 +24,7 @@ import random
 import time
 from typing import Any, AsyncIterator, Iterator, Protocol
 
+from .hook import TokenUsage
 from .messages import Message, Role, StreamEvent, ToolCall
 
 logger = logging.getLogger("agent_core.llm")
@@ -93,6 +94,7 @@ class LLM:
         base_delay: float = 1.0,
         max_delay: float = 30.0,
         retry_on: tuple[type[BaseException], ...] = (Exception,),
+        hooks: list | None = None,
     ):
         self.base_url = base_url
         self.api_key = api_key
@@ -105,6 +107,10 @@ class LLM:
         # 懒加载：按需创建，避免只用同步方法却初始化异步 client
         self._sync_client: Any = None
         self._async_client: Any = None
+
+        # hook 注册表（由 Agent 自动注入共享，见 Agent.__init__）
+        from .hook import HookRegistry
+        self.hooks = HookRegistry(hooks)
 
     # ── 同步 SDK client（懒加载）──────────────────────────────
 
@@ -127,46 +133,91 @@ class LLM:
     # ── invoke：同步非流式 ───────────────────────────────────
 
     def invoke(self, messages: list[Message], tools: list[dict] | None = None) -> Message:
-        """同步非流式调用。失败按 max_retries 自动重试。"""
+        """同步非流式调用。失败按 max_retries 自动重试。
+
+        触发 on_llm_start → on_llm_end（含 usage）/ on_llm_error（重试）。
+        """
+        from .hook import LLMEndEvent, LLMErrorEvent, LLMStartEvent
+
+        self.hooks.emit(LLMStartEvent(type="on_llm_start", messages=messages, tools=tools))
+        t0 = time.time()
+        usage = None
         last_exc: BaseException | None = None
+        msg: Message | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                return self._invoke_once(messages, tools)
+                msg, usage = self._invoke_once(messages, tools)
+                break
             except self.retry_on as e:
                 last_exc = e
                 if attempt >= self.max_retries:
                     break
+                self.hooks.emit(LLMErrorEvent(
+                    type="on_llm_error", error=f"{type(e).__name__}: {e}", attempt=attempt + 1
+                ))
                 self._log_retry(attempt, e)
                 time.sleep(self._compute_delay(attempt))
-        assert last_exc is not None
-        raise last_exc
+        if msg is None:
+            # 最终失败：emit error（attempt=0 表示最终失败）
+            self.hooks.emit(LLMErrorEvent(
+                type="on_llm_error", error=f"{type(last_exc).__name__}: {last_exc}", attempt=0
+            ))
+            assert last_exc is not None
+            raise last_exc
+        self.hooks.emit(LLMEndEvent(
+            type="on_llm_end", response=msg, usage=usage, duration=time.time() - t0
+        ))
+        return msg
 
-    def _invoke_once(self, messages: list[Message], tools: list[dict] | None) -> Message:
+    def _invoke_once(self, messages: list[Message], tools: list[dict] | None) -> tuple[Message, TokenUsage]:
         kwargs = self._build_kwargs(messages, tools, stream=False)
         response = self.sync_client.chat.completions.create(**kwargs)
-        return _response_to_message(response.choices[0].message)
+        usage = _extract_usage(getattr(response, "usage", None))
+        return _response_to_message(response.choices[0].message), usage
 
     # ── ainvoke：异步非流式 ──────────────────────────────────
 
     async def ainvoke(self, messages: list[Message], tools: list[dict] | None = None) -> Message:
-        """异步非流式调用。失败按 max_retries 自动重试。"""
+        """异步非流式调用。失败按 max_retries 自动重试。
+
+        触发 on_llm_start → on_llm_end（含 usage）/ on_llm_error（重试）。
+        """
+        from .hook import LLMEndEvent, LLMErrorEvent, LLMStartEvent
+
+        await self.hooks.aemit(LLMStartEvent(type="on_llm_start", messages=messages, tools=tools))
+        t0 = time.time()
+        usage = None
         last_exc: BaseException | None = None
+        msg: Message | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                return await self._ainvoke_once(messages, tools)
+                msg, usage = await self._ainvoke_once(messages, tools)
+                break
             except self.retry_on as e:
                 last_exc = e
                 if attempt >= self.max_retries:
                     break
+                await self.hooks.aemit(LLMErrorEvent(
+                    type="on_llm_error", error=f"{type(e).__name__}: {e}", attempt=attempt + 1
+                ))
                 self._log_retry(attempt, e)
                 await asyncio.sleep(self._compute_delay(attempt))
-        assert last_exc is not None
-        raise last_exc
+        if msg is None:
+            await self.hooks.aemit(LLMErrorEvent(
+                type="on_llm_error", error=f"{type(last_exc).__name__}: {last_exc}", attempt=0
+            ))
+            assert last_exc is not None
+            raise last_exc
+        await self.hooks.aemit(LLMEndEvent(
+            type="on_llm_end", response=msg, usage=usage, duration=time.time() - t0
+        ))
+        return msg
 
-    async def _ainvoke_once(self, messages: list[Message], tools: list[dict] | None) -> Message:
+    async def _ainvoke_once(self, messages: list[Message], tools: list[dict] | None) -> tuple[Message, TokenUsage]:
         kwargs = self._build_kwargs(messages, tools, stream=False)
         response = await self.async_client.chat.completions.create(**kwargs)
-        return _response_to_message(response.choices[0].message)
+        usage = _extract_usage(getattr(response, "usage", None))
+        return _response_to_message(response.choices[0].message), usage
 
     # ── stream：同步流式 ─────────────────────────────────────
 
@@ -175,12 +226,26 @@ class LLM:
     ) -> Iterator[StreamEvent]:
         """同步流式调用，逐 token 产出 StreamEvent，最后产出 done。
 
-        流式分支不支持单次调用级重试（流中途失败难恢复）；
-        若需重试，调用方可在流为空时自行重试整轮。
+        触发 on_llm_start → on_llm_new_token（逐 token）→ on_llm_end（done，含 usage）。
+        流式分支不支持单次调用级重试。
         """
+        from .hook import LLMEndEvent, LLMNewTokenEvent, LLMStartEvent
+
+        self.hooks.emit(LLMStartEvent(type="on_llm_start", messages=messages, tools=tools))
+        t0 = time.time()
         kwargs = self._build_kwargs(messages, tools, stream=True)
         stream = self.sync_client.chat.completions.create(**kwargs)
-        yield from _drain_stream(stream)
+        for event in _drain_stream(stream):
+            if event.type == "token":
+                self.hooks.emit(LLMNewTokenEvent(type="on_llm_new_token", token=event.delta or ""))
+            elif event.type == "done":
+                self.hooks.emit(LLMEndEvent(
+                    type="on_llm_end",
+                    response=event.final,
+                    usage=event.usage,
+                    duration=time.time() - t0,
+                ))
+            yield event
 
     # ── astream：异步流式 ────────────────────────────────────
 
@@ -189,11 +254,25 @@ class LLM:
     ) -> AsyncIterator[StreamEvent]:
         """异步流式调用，逐 token 产出 StreamEvent，最后产出 done。
 
+        触发 on_llm_start → on_llm_new_token（逐 token）→ on_llm_end（done，含 usage）。
         用 ``async for event in llm.astream(...)`` 消费。
         """
+        from .hook import LLMEndEvent, LLMNewTokenEvent, LLMStartEvent
+
+        await self.hooks.aemit(LLMStartEvent(type="on_llm_start", messages=messages, tools=tools))
+        t0 = time.time()
         kwargs = self._build_kwargs(messages, tools, stream=True)
         stream = await self.async_client.chat.completions.create(**kwargs)
         async for event in _addrain_stream(stream):
+            if event.type == "token":
+                await self.hooks.aemit(LLMNewTokenEvent(type="on_llm_new_token", token=event.delta or ""))
+            elif event.type == "done":
+                await self.hooks.aemit(LLMEndEvent(
+                    type="on_llm_end",
+                    response=event.final,
+                    usage=event.usage,
+                    duration=time.time() - t0,
+                ))
             yield event
 
     # ── 内部工具 ─────────────────────────────────────────────
@@ -209,6 +288,8 @@ class LLM:
             kwargs["tools"] = tools
         if stream:
             kwargs["stream"] = True
+            # 百炼/OpenAI 流式默认不返回 usage，需显式开启（尾 chunk 带 usage）
+            kwargs["stream_options"] = {"include_usage": True}
         return kwargs
 
     def _compute_delay(self, attempt: int) -> float:
@@ -294,15 +375,43 @@ def _response_to_message(msg: Any) -> Message:
     return Message(role=Role.ASSISTANT, content=msg.content, tool_calls=tool_calls)
 
 
+def _extract_usage(usage: Any) -> TokenUsage:
+    """从 openai SDK 响应的 usage 对象提取 TokenUsage（含百炼 cached_tokens）。
+
+    百炼/OpenAI 命中缓存的 token 在 ``usage.prompt_tokens_details.cached_tokens``，
+    未触发缓存时该字段不存在，getattr 容错返回 0。
+    """
+    if usage is None:
+        return TokenUsage()
+    cached = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None:
+        cached = getattr(details, "cached_tokens", 0) or 0
+    return TokenUsage(
+        prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+        completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+        total_tokens=getattr(usage, "total_tokens", 0) or 0,
+        cached_tokens=cached,
+    )
+
+
 # ── 流式处理：累积 content + 增量拼接 tool_calls ─────────────
 
 
 def _drain_stream(stream: Any) -> Iterator[StreamEvent]:
-    """同步消费流，逐 token 产出，流结束后产出 tool_call + done。"""
+    """同步消费流，逐 token 产出，流结束后产出 tool_call + done。
+
+    尾 chunk 通常 choices 为空但带 usage（stream_options.include_usage=true 时），
+    在跳过空 choices 前先提取 usage，放进 done 事件。
+    """
     content_buf: list[str] = []
     tc_acc: dict[int, dict[str, Any]] = {}
+    usage = None
 
     for chunk in stream:
+        # 尾 chunk：choices 为空但可能带 usage，先提取再跳过
+        if getattr(chunk, "usage", None) is not None:
+            usage = _extract_usage(chunk.usage)
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -316,15 +425,21 @@ def _drain_stream(stream: Any) -> Iterator[StreamEvent]:
     if final.tool_calls:
         for call in final.tool_calls:
             yield StreamEvent(type="tool_call", call=call)
-    yield StreamEvent(type="done", final=final)
+    yield StreamEvent(type="done", final=final, usage=usage)
 
 
 async def _addrain_stream(stream: Any) -> AsyncIterator[StreamEvent]:
-    """异步消费流，逐 token 产出，流结束后产出 tool_call + done。"""
+    """异步消费流，逐 token 产出，流结束后产出 tool_call + done。
+
+    尾 chunk 通常 choices 为空但带 usage，在跳过空 choices 前先提取。
+    """
     content_buf: list[str] = []
     tc_acc: dict[int, dict[str, Any]] = {}
+    usage = None
 
     async for chunk in stream:
+        if getattr(chunk, "usage", None) is not None:
+            usage = _extract_usage(chunk.usage)
         if not chunk.choices:
             continue
         delta = chunk.choices[0].delta
@@ -338,7 +453,7 @@ async def _addrain_stream(stream: Any) -> AsyncIterator[StreamEvent]:
     if final.tool_calls:
         for call in final.tool_calls:
             yield StreamEvent(type="tool_call", call=call)
-    yield StreamEvent(type="done", final=final)
+    yield StreamEvent(type="done", final=final, usage=usage)
 
 
 def _accumulate_tool_calls(tc_acc: dict[int, dict[str, Any]], tool_calls: Any) -> None:
