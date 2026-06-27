@@ -35,7 +35,7 @@ class Agent:
         llm: LLM 组件（实现 LLMProtocol，有 invoke/ainvoke/stream/astream）。
         tools: 工具注册表。无工具时传 ToolRegistry() 或 None。
         system_prompt: 系统提示词，空字符串则不加 system 消息。
-        max_iterations: 最大循环轮数，防止死循环。默认 10。
+        max_iterations: 最大循环轮数，防止死循环。默认 2000。
 
     四种调用方式::
 
@@ -50,7 +50,7 @@ class Agent:
         llm: LLMProtocol,
         tools: ToolRegistry | None = None,
         system_prompt: str = "",
-        max_iterations: int = 10,
+        max_iterations: int = 2000,
     ):
         self.llm = llm
         self.tools = tools or ToolRegistry()
