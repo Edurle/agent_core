@@ -6,25 +6,34 @@ A general-purpose agent core library — the foundational layer for building AI 
 
 ✅ P0 — minimal agent loop with tool calling.
 ✅ P1 — streaming, async (dual-track), pydantic schema, retry.
+✅ P2 — unified interface: `invoke` / `ainvoke` / `stream` / `astream`.
 
 ## Overview
 
-`agent_core` is a **bottom-layer library** that provides core capabilities for
-building AI agents:
+`agent_core` is a **bottom-layer library** for building AI agents, built on a
+**unified interface model**: every core component (`Agent`, `LLM`) exposes four
+methods — one per (sync|async) × (blocking|streaming) combination.
 
-- **Unified LLM access** — one `LLMClient` abstraction over any OpenAI-compatible
-  platform (OpenAI / DeepSeek / Kimi / Qwen / GLM / Ollama / vLLM ...).
-- **Tool system** — turn plain Python functions into LLM-callable tools, with
-  automatic JSON schema generation (basic types + pydantic models).
-- **Agent loop** — a ReAct-style loop (reason → act → observe).
-- **Streaming** — `run_stream()` yields tokens as they arrive.
-- **Async (dual-track)** — `AsyncAgent` runs tools in parallel via `asyncio.gather`.
-- **Retry** — `RetryLLM` wraps any client with exponential backoff.
+```python
+class Agent:
+    def invoke(input) -> str: ...           # sync, blocking
+    async def ainvoke(input) -> str: ...    # async, blocking (parallel tools)
+    def stream(input) -> Iterator: ...      # sync, streaming
+    async def astream(input) -> AsyncIter: ...  # async, streaming (parallel tools)
+```
+
+Capabilities:
+- **Unified LLM access** — one `LLM` class over any OpenAI-compatible platform.
+- **Tool system** — plain Python functions → LLM-callable tools, with automatic
+  JSON schema generation (basic types + pydantic models).
+- **Agent loop** — ReAct-style (reason → act → observe).
+- **Streaming** — `stream` / `astream` yield tokens as they arrive.
+- **Async parallelism** — `ainvoke` / `astream` run tools in parallel via `asyncio.gather`.
+- **Retry** — built into `LLM(max_retries=...)`, exponential backoff.
 
 **Switch platforms by changing 3 params**: `base_url` + `api_key` + `model`.
 
-> Design docs and architecture notes live in the project's Obsidian vault, not
-> in this repository.
+> Design docs and architecture notes live in the project's Obsidian vault.
 
 ## Quick Start
 
@@ -37,7 +46,7 @@ pip install -r requirements.txt
 ### Minimal example
 
 ```python
-from agent_core import Agent, OpenAICompatibleClient, ToolRegistry, tool
+from agent_core import Agent, LLM, ToolRegistry, tool
 
 @tool
 def add(a: int, b: int) -> int:
@@ -47,49 +56,34 @@ def add(a: int, b: int) -> int:
 tools = ToolRegistry()
 tools.register(add)
 
-# Switch platform: change these 3 lines only
-llm = OpenAICompatibleClient(
+llm = LLM(
     base_url="https://api.deepseek.com/v1",
     api_key="sk-xxx",
     model="deepseek-chat",
 )
 
 agent = Agent(llm=llm, tools=tools, system_prompt="你是一个会用工具的助手")
-print(agent.run("3 加 5 是多少？"))   # → "3 加 5 等于 8。"
+print(agent.invoke("3 加 5 是多少？"))   # → "3 加 5 等于 8。"
 ```
 
-### Run the example
-
-```bash
-set DEEPSEEK_API_KEY=sk-xxx     # or OPENAI_API_KEY
-python examples/quickstart.py
-```
-
-### Streaming
+### Four calling styles
 
 ```python
-from agent_core import Agent, StreamingLLM
+# sync blocking
+answer = agent.invoke("...")
 
-llm = StreamingLLM(base_url=..., api_key=..., model=...)
-agent = Agent(llm=llm, tools=tools)
-for event in agent.run_stream("写一首诗"):
+# async blocking (tools run in parallel)
+answer = await agent.ainvoke("...")
+
+# sync streaming
+for event in agent.stream("..."):
     if event.type == "token":
         print(event.delta, end="", flush=True)
-```
 
-### Async (parallel tool execution)
-
-```python
-import asyncio
-from agent_core import AsyncAgent, AsyncOpenAICompatibleClient, AsyncToolRegistry
-
-async def main():
-    llm = AsyncOpenAICompatibleClient(base_url=..., api_key=..., model=...)
-    agent = AsyncAgent(llm=llm, tools=async_tools)
-    # multiple tool_calls in one turn run in parallel via asyncio.gather
-    print(await agent.run("..."))
-
-asyncio.run(main())
+# async streaming
+async for event in agent.astream("..."):
+    if event.type == "token":
+        print(event.delta, end="", flush=True)
 ```
 
 ### Pydantic tool params
@@ -108,27 +102,33 @@ def search(params: SearchParams) -> list[dict]:
     ...
 ```
 
-### Retry
+### Retry (built into LLM)
 
 ```python
-from agent_core import OpenAICompatibleClient, RetryLLM
-llm = RetryLLM(OpenAICompatibleClient(...), max_retries=3)  # auto-retry on failure
+llm = LLM(base_url=..., api_key=..., model=..., max_retries=3)  # auto-retry
+```
+
+### Run the example
+
+```bash
+set DEEPSEEK_API_KEY=sk-xxx     # or OPENAI_API_KEY
+python examples/quickstart.py
 ```
 
 ## Architecture
 
 ```
-agent.py        ← Agent loop (orchestration layer)
-tools.py        ← Tool system (capability layer)
-llm.py          ← LLM access (foundation layer)
-messages.py     ← Unified message model (leaf, no deps)
+agent.py    ← Agent (invoke/ainvoke/stream/astream) — orchestration
+llm.py      ← LLM (invoke/ainvoke/stream/astream) — foundation, built-in retry
+tools.py    ← Tool/ToolRegistry (sync execute + async aexecute) — capability
+messages.py ← Message/Role/ToolCall/StreamEvent — data models (leaf)
 ```
 
 Dependencies flow one way down; no cycles. The core loop:
 
 ```
-LLM chat → parse tool_calls → execute tools → append tool results → repeat
-        ↘ no tool_calls → return final answer
+LLM invoke → parse tool_calls → execute tools → append tool results → repeat
+           ↘ no tool_calls → return final answer
 ```
 
 ## Platform Cheatsheet
@@ -145,14 +145,13 @@ LLM chat → parse tool_calls → execute tools → append tool results → repe
 ## Tests
 
 ```bash
-pytest tests/        # 94 tests, no API key / network needed (mock LLM)
+pytest tests/        # 84 tests, no API key / network needed (mock LLM)
 ```
 
 ## Tech Stack
 
 - **Python** 3.10+
-- `openai` SDK (the only runtime dependency)
-- `pytest` for testing
+- `openai` + `pydantic` (runtime); `pytest` + `pytest-asyncio` (dev)
 
 ## License
 

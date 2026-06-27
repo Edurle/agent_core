@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from typing import TYPE_CHECKING, Any, Callable, get_type_hints, overload
@@ -65,20 +66,31 @@ class Tool:
         self.pydantic_models: dict[str, type] = pydantic_models or {}
 
     def run(self, **kwargs: Any) -> str:
-        """执行工具函数，返回值 stringify 为字符串。
+        """执行工具函数（同步），返回值 stringify 为字符串。
 
         对 pydantic_models 中登记的参数，先做 Model(**value) 校验再传入。
         校验失败抛 ValidationError，由 ToolRegistry.execute 捕获转错误字符串。
+        """
+        call_kwargs = self._resolve_pydantic_params(kwargs)
+        result = self.func(**call_kwargs)
+        return self._stringify(result)
+
+    def _resolve_pydantic_params(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """把 dict 形式的 pydantic 参数构造为模型实例（校验）。
+
+        sync run 和 async 执行共用此逻辑。已是模型实例的参数原样保留。
         """
         call_kwargs = dict(kwargs)
         for pname, model_cls in self.pydantic_models.items():
             if pname in call_kwargs:
                 raw = call_kwargs[pname]
-                # 已是模型实例则跳过；dict 则构造校验
                 if not isinstance(raw, model_cls):
                     call_kwargs[pname] = model_cls(**raw)
-        result = self.func(**call_kwargs)
-        return self._stringify(result)
+        return call_kwargs
+
+    def is_async(self) -> bool:
+        """工具函数是否是协程函数。"""
+        return inspect.iscoroutinefunction(self.func)
 
     def to_schema(self) -> dict:
         """转为 OpenAI function calling 的 tool schema。"""
@@ -129,7 +141,7 @@ class ToolRegistry:
         return [t.to_schema() for t in self._tools.values()]
 
     def execute(self, name: str, arguments: dict) -> str:
-        """按名查找并执行工具。
+        """按名查找并同步执行工具。
 
         工具执行出错时返回错误字符串而非抛异常，
         让 LLM 看到错误后有机会修正参数或换工具重试。
@@ -143,6 +155,31 @@ class ToolRegistry:
     def execute_call(self, call: ToolCall) -> str:
         """执行一个 ToolCall（agent 循环的便捷入口）。"""
         return self.execute(call.name, call.arguments)
+
+    async def aexecute(self, name: str, arguments: dict) -> str:
+        """按名查找并异步执行工具。
+
+        - 协程函数工具：直接 await（先构造 pydantic 参数）。
+        - 同步函数工具：丢到线程池（asyncio.to_thread），避免阻塞事件循环。
+
+        工具异常被捕获返回错误字符串（ReAct 语义，与 execute 一致）。
+        """
+        tool = self.get(name)
+        try:
+            if tool.is_async():
+                # 协程工具：构造 pydantic 参数后 await
+                call_kwargs = tool._resolve_pydantic_params(arguments)
+                result = await tool.func(**call_kwargs)
+                return Tool._stringify(result)
+            # 同步工具：丢线程池
+            return await asyncio.to_thread(tool.run, **arguments)
+        except Exception as e:  # noqa: BLE001
+            return f"[工具执行错误: {type(e).__name__}: {e}]"
+
+    async def aexecute_many(self, calls: list[ToolCall]) -> list[str]:
+        """并行执行多个工具调用（asyncio.gather），返回与 calls 顺序对应的结果列表。"""
+        tasks = [self.aexecute(c.name, c.arguments) for c in calls]
+        return await asyncio.gather(*tasks)
 
 
 # ── @tool 装饰器（P0 简化版）─────────────────────────────────

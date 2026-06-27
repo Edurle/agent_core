@@ -1,41 +1,46 @@
-"""llm.py 测试。
+"""LLM 统一组件测试（invoke/ainvoke/stream/astream + 内置重试 + 格式转换）。
 
-用 mock 的 openai SDK 响应对象测试 OpenAICompatibleClient 的转换逻辑，
+用 mock 的 openai SDK 对象（FakeOpenAI / FakeAsyncOpenAI）测试四方法，
 避免真实网络调用。
 
-通过 monkeypatch 把 openai.OpenAI 替换成假实现，验证：
-- 请求组装（messages / tools 透传）
-- 响应解析（content / tool_calls）
-- arguments JSON 字符串 -> dict
-- tool 结果消息的 tool_call_id 必填校验
+验证：
+- invoke/ainvoke：请求组装、响应解析、arguments JSON→dict
+- stream/astream：token 流、增量 tool_calls 拼接、done 事件
+- 内置重试：失败 N 次后成功、退避、retry_on 过滤
+- 懒加载：sync_client/async_client 按需创建
+- 格式转换：_message_to_openai / _parse_arguments / _response_to_message
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
 import pytest
 
-from agent_core.llm import OpenAICompatibleClient, _message_to_openai, _parse_arguments
+from agent_core.llm import (
+    LLM,
+    _message_to_openai,
+    _parse_arguments,
+    _response_to_message,
+)
 from agent_core.messages import Message, Role, ToolCall
 
 
-# ── 假的 openai SDK 响应构造 ────────────────────────────────
+# ═══════════════════════════════════════════════════════════
+#  Mock SDK 构造
+# ═══════════════════════════════════════════════════════════
 
 
 def make_response(content=None, tool_calls=None):
-    """构造一个模拟 openai SDK 响应的对象树。"""
+    """构造模拟 openai SDK 非流式响应。"""
     tc_objs = None
     if tool_calls:
         tc_objs = [
             SimpleNamespace(
                 id=tc["id"],
-                type="function",
-                function=SimpleNamespace(
-                    name=tc["name"],
-                    arguments=tc["arguments"],  # JSON 字符串
-                ),
+                function=SimpleNamespace(name=tc["name"], arguments=tc["arguments"]),
             )
             for tc in tool_calls
         ]
@@ -43,57 +48,146 @@ def make_response(content=None, tool_calls=None):
     return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
 
 
-class FakeOpenAI:
-    """替换 openai.OpenAI 的假类，记录请求并按预设返回。"""
+def _delta(content=None, tool_calls=None):
+    """构造流式 chunk 的 delta。"""
+    tc_objs = None
+    if tool_calls:
+        tc_objs = [
+            SimpleNamespace(
+                index=tc["index"],
+                id=tc.get("id"),
+                function=SimpleNamespace(name=tc.get("name"), arguments=tc.get("args")),
+            )
+            for tc in tool_calls
+        ]
+    return SimpleNamespace(content=content, tool_calls=tc_objs)
 
-    instances: list["FakeOpenAI"] = []
+
+def _chunk(delta):
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
+
+
+class _FakeStream:
+    """同步可迭代流。"""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __iter__(self):
+        return iter(self._chunks)
+
+
+class _FakeAsyncStream:
+    """异步可迭代流。"""
+
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+
+class FakeOpenAI:
+    """替换 openai.OpenAI。记录 create 参数，按队列返回预设响应/流。
+
+    add_response 可传入 Exception 实例：取出时会抛出该异常（模拟失败）。
+    """
+
+    instances = []
 
     def __init__(self, base_url=None, api_key=None):
         self.base_url = base_url
         self.api_key = api_key
-        self.last_kwargs: dict | None = None
-        self.next_response = None
+        self.calls = []  # 记录每次 create 的 kwargs
+        self._responses = []  # 非流式响应队列（响应对象或异常实例）
+        self._streams = []  # 流式 chunks 队列
         FakeOpenAI.instances.append(self)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
-        # 构造类似 openai SDK 的链式访问结构
-        self.chat = SimpleNamespace(
-            completions=SimpleNamespace(create=self._create)
-        )
+    def add_response(self, response):
+        self._responses.append(response)
 
-    def set_response(self, response):
-        self.next_response = response
+    def add_stream(self, chunks):
+        self._streams.append(list(chunks))
 
     def _create(self, **kwargs):
-        self.last_kwargs = kwargs
-        return self.next_response
+        self.calls.append(kwargs)
+        if kwargs.get("stream"):
+            return _FakeStream(self._streams.pop(0))
+        resp = self._responses.pop(0)
+        if isinstance(resp, BaseException):
+            raise resp
+        return resp
+
+
+class FakeAsyncOpenAI:
+    """替换 openai.AsyncOpenAI。异步版。
+
+    add_response 可传入 Exception 实例：取出时会抛出（模拟失败）。
+    """
+
+    instances = []
+
+    def __init__(self, base_url=None, api_key=None):
+        self.base_url = base_url
+        self.api_key = api_key
+        self.calls = []
+        self._responses = []
+        self._streams = []
+        FakeAsyncOpenAI.instances.append(self)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def add_response(self, response):
+        self._responses.append(response)
+
+    def add_stream(self, chunks):
+        self._streams.append(list(chunks))
+
+    async def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        await asyncio.sleep(0)
+        if kwargs.get("stream"):
+            return _FakeAsyncStream(self._streams.pop(0))
+        resp = self._responses.pop(0)
+        if isinstance(resp, BaseException):
+            raise resp
+        return resp
 
 
 @pytest.fixture
-def fake_openai(monkeypatch):
-    """monkeypatch openai.OpenAI 为 FakeOpenAI，返回工厂供测试用。"""
+def fake_sdk(monkeypatch):
+    """替换 openai.OpenAI 和 AsyncOpenAI。"""
     FakeOpenAI.instances.clear()
+    FakeAsyncOpenAI.instances.clear()
     import openai
 
     monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
-    return FakeOpenAI
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeAsyncOpenAI)
+    return FakeOpenAI, FakeAsyncOpenAI
+
+
+# ═══════════════════════════════════════════════════════════
+#  纯函数测试
+# ═══════════════════════════════════════════════════════════
 
 
 class TestParseArguments:
     def test_valid_json(self):
         assert _parse_arguments('{"a": 1}') == {"a": 1}
 
-    def test_empty_string(self):
+    def test_empty(self):
         assert _parse_arguments("") == {}
-
-    def test_none(self):
         assert _parse_arguments(None) == {}
 
-    def test_invalid_json_returns_empty(self):
-        """非法 JSON 容错为空 dict，不抛异常。"""
-        assert _parse_arguments("{bad json") == {}
+    def test_invalid_json(self):
+        assert _parse_arguments("{bad") == {}
 
-    def test_non_dict_json_wrapped(self):
-        """非 dict 的合法 JSON（如数组）被包裹。"""
+    def test_non_dict_wrapped(self):
         assert _parse_arguments("[1,2]") == {"value": [1, 2]}
 
 
@@ -104,101 +198,269 @@ class TestMessageToOpenAI:
         assert d["role"] == "user"
         assert d["content"] == "hi"
 
-    def test_system_message(self):
-        m = Message(role=Role.SYSTEM, content="sys")
-        assert _message_to_openai(m)["role"] == "system"
-
-    def test_assistant_with_tool_calls(self):
+    def test_assistant_tool_calls(self):
         m = Message(
-            role=Role.ASSISTANT,
-            content=None,
+            role=Role.ASSISTANT, content=None,
             tool_calls=[ToolCall(id="1", name="add", arguments={"a": 1})],
         )
         d = _message_to_openai(m)
         assert d["tool_calls"][0]["id"] == "1"
-        assert d["tool_calls"][0]["function"]["name"] == "add"
-        # arguments 应被序列化为 JSON 字符串
         assert json.loads(d["tool_calls"][0]["function"]["arguments"]) == {"a": 1}
 
-    def test_tool_message_requires_id(self):
-        """role=tool 但无 tool_call_id 应报错。"""
-        m = Message(role=Role.TOOL, content="result")  # 缺 tool_call_id
+    def test_tool_requires_id(self):
         with pytest.raises(ValueError, match="tool_call_id"):
-            _message_to_openai(m)
+            _message_to_openai(Message(role=Role.TOOL, content="x"))
 
-    def test_tool_message_full(self):
+    def test_tool_full(self):
         m = Message(role=Role.TOOL, content="42", tool_call_id="c1", name="add")
         d = _message_to_openai(m)
-        assert d["role"] == "tool"
-        assert d["content"] == "42"
         assert d["tool_call_id"] == "c1"
         assert d["name"] == "add"
 
 
-class TestOpenAICompatibleClient:
-    def test_chat_simple_response(self, fake_openai):
-        """纯文本回复。"""
-        client = OpenAICompatibleClient("http://x", "k", "m")
-        client._client.set_response(make_response(content="hello"))
-        msg = client.chat([Message(role=Role.USER, content="hi")])
+class TestResponseToMessage:
+    def test_text_response(self):
+        msg = SimpleNamespace(content="hi", tool_calls=None)
+        result = _response_to_message(msg)
+        assert result.content == "hi"
+        assert result.tool_calls is None
 
-        assert msg.role == Role.ASSISTANT
+    def test_tool_calls_parsed(self):
+        msg = SimpleNamespace(
+            content=None,
+            tool_calls=[SimpleNamespace(
+                id="c1", function=SimpleNamespace(name="add", arguments='{"a":1}')
+            )],
+        )
+        result = _response_to_message(msg)
+        assert result.tool_calls[0].arguments == {"a": 1}
+        assert isinstance(result.tool_calls[0].arguments, dict)
+
+
+# ═══════════════════════════════════════════════════════════
+#  LLM.invoke（同步非流式）
+# ═══════════════════════════════════════════════════════════
+
+
+class TestLLMInvoke:
+    def test_invoke_text(self, fake_sdk):
+        FakeSync, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.sync_client.add_response(make_response(content="hello"))
+        msg = llm.invoke([Message(role=Role.USER, content="hi")])
         assert msg.content == "hello"
         assert msg.tool_calls is None
 
-    def test_chat_with_tool_calls(self, fake_openai):
-        """工具调用响应，arguments 应被解析为 dict。"""
-        client = OpenAICompatibleClient("http://x", "k", "m")
-        client._client.set_response(make_response(
+    def test_invoke_tool_calls(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.sync_client.add_response(make_response(
             content=None,
-            tool_calls=[{"id": "c1", "name": "add", "arguments": '{"a": 3, "b": 5}'}],
+            tool_calls=[{"id": "c1", "name": "add", "arguments": '{"a":3,"b":5}'}],
         ))
-        msg = client.chat([Message(role=Role.USER, content="算")])
-
-        assert msg.tool_calls is not None
-        assert msg.tool_calls[0].id == "c1"
-        assert msg.tool_calls[0].name == "add"
-        # 关键：arguments 是 dict 而非字符串
+        msg = llm.invoke([Message(role=Role.USER, content="x")])
         assert msg.tool_calls[0].arguments == {"a": 3, "b": 5}
-        assert isinstance(msg.tool_calls[0].arguments, dict)
 
-    def test_chat_passes_tools_param(self, fake_openai):
-        """tools schema 应透传给 SDK。"""
-        client = OpenAICompatibleClient("http://x", "k", "m")
-        client._client.set_response(make_response(content="ok"))
+    def test_invoke_passes_tools(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.sync_client.add_response(make_response(content="ok"))
         schemas = [{"type": "function", "function": {"name": "add"}}]
-        client.chat([Message(role=Role.USER, content="x")], tools=schemas)
+        llm.invoke([Message(role=Role.USER, content="x")], tools=schemas)
+        assert llm.sync_client.calls[0]["tools"] == schemas
 
-        assert client._client.last_kwargs["tools"] == schemas
-        assert client._client.last_kwargs["model"] == "m"
+    def test_invoke_no_tools_omits_param(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.sync_client.add_response(make_response(content="ok"))
+        llm.invoke([Message(role=Role.USER, content="x")])
+        assert "tools" not in llm.sync_client.calls[0]
 
-    def test_chat_no_tools_no_kwarg(self, fake_openai):
-        """无 tools 时不传 tools 参数。"""
-        client = OpenAICompatibleClient("http://x", "k", "m")
-        client._client.set_response(make_response(content="ok"))
-        client.chat([Message(role=Role.USER, content="x")], tools=None)
-        assert "tools" not in client._client.last_kwargs
 
-    def test_chat_multiple_tool_calls(self, fake_openai):
-        """并行工具调用。"""
-        client = OpenAICompatibleClient("http://x", "k", "m")
-        client._client.set_response(make_response(
-            content=None,
-            tool_calls=[
-                {"id": "1", "name": "add", "arguments": '{"a":1,"b":2}'},
-                {"id": "2", "name": "add", "arguments": '{"a":3,"b":4}'},
-            ],
+# ═══════════════════════════════════════════════════════════
+#  LLM.ainvoke（异步非流式）
+# ═══════════════════════════════════════════════════════════
+
+
+class TestLLMAinvoke:
+    @pytest.mark.asyncio
+    async def test_ainvoke_text(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.async_client.add_response(make_response(content="hello"))
+        msg = await llm.ainvoke([Message(role=Role.USER, content="hi")])
+        assert msg.content == "hello"
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_tool_calls(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.async_client.add_response(make_response(
+            tool_calls=[{"id": "c1", "name": "add", "arguments": '{"a":1}'}],
         ))
-        msg = client.chat([Message(role=Role.USER, content="x")])
-        assert len(msg.tool_calls) == 2
-        assert {tc.id for tc in msg.tool_calls} == {"1", "2"}
+        msg = await llm.ainvoke([Message(role=Role.USER, content="x")])
+        assert msg.tool_calls[0].arguments == {"a": 1}
 
-    def test_chat_invalid_arguments_handled(self, fake_openai):
-        """arguments 是非法 JSON 时应容错为空 dict。"""
-        client = OpenAICompatibleClient("http://x", "k", "m")
-        client._client.set_response(make_response(
-            content=None,
-            tool_calls=[{"id": "1", "name": "add", "arguments": "not json{"}],
-        ))
-        msg = client.chat([Message(role=Role.USER, content="x")])
-        assert msg.tool_calls[0].arguments == {}
+
+# ═══════════════════════════════════════════════════════════
+#  LLM.stream（同步流式）
+# ═══════════════════════════════════════════════════════════
+
+
+class TestLLMStream:
+    def test_text_stream(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.sync_client.add_stream([
+            _chunk(_delta(content="Hello")),
+            _chunk(_delta(content=" world")),
+        ])
+        events = list(llm.stream([Message(role=Role.USER, content="x")]))
+        tokens = [e.delta for e in events if e.type == "token"]
+        assert tokens == ["Hello", " world"]
+        done = [e for e in events if e.type == "done"]
+        assert done[0].final.content == "Hello world"
+
+    def test_tool_calls_incremental_assembly(self, fake_sdk):
+        """流式 tool_calls 分多 chunk，应累积拼接。"""
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.sync_client.add_stream([
+            _chunk(_delta(tool_calls=[{"index": 0, "id": "c1", "name": "add"}])),
+            _chunk(_delta(tool_calls=[{"index": 0, "args": '{"a": 3'}])),
+            _chunk(_delta(tool_calls=[{"index": 0, "args": ', "b": 5}'}])),
+        ])
+        events = list(llm.stream([Message(role=Role.USER, content="x")]))
+        tc_events = [e for e in events if e.type == "tool_call"]
+        assert len(tc_events) == 1
+        assert tc_events[0].call.arguments == {"a": 3, "b": 5}
+
+    def test_multiple_parallel_tool_calls(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.sync_client.add_stream([
+            _chunk(_delta(tool_calls=[{"index": 0, "id": "1", "name": "add", "args": '{"a":1,"b":2}'}])),
+            _chunk(_delta(tool_calls=[{"index": 1, "id": "2", "name": "add", "args": '{"a":3,"b":4}'}])),
+        ])
+        events = list(llm.stream([Message(role=Role.USER, content="x")]))
+        calls = [e.call for e in events if e.type == "tool_call"]
+        assert {c.id for c in calls} == {"1", "2"}
+
+
+# ═══════════════════════════════════════════════════════════
+#  LLM.astream（异步流式）
+# ═══════════════════════════════════════════════════════════
+
+
+class TestLLMAstream:
+    @pytest.mark.asyncio
+    async def test_text_stream(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.async_client.add_stream([
+            _chunk(_delta(content="Hello")),
+            _chunk(_delta(content=" world")),
+        ])
+        events = []
+        async for e in llm.astream([Message(role=Role.USER, content="x")]):
+            events.append(e)
+        tokens = [e.delta for e in events if e.type == "token"]
+        assert tokens == ["Hello", " world"]
+        assert [e for e in events if e.type == "done"]
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_incremental(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.async_client.add_stream([
+            _chunk(_delta(tool_calls=[{"index": 0, "id": "c1", "name": "add"}])),
+            _chunk(_delta(tool_calls=[{"index": 0, "args": '{"a":1,"b":2}'}])),
+        ])
+        events = []
+        async for e in llm.astream([Message(role=Role.USER, content="x")]):
+            events.append(e)
+        tc = [e for e in events if e.type == "tool_call"]
+        assert tc[0].call.arguments == {"a": 1, "b": 2}
+
+
+# ═══════════════════════════════════════════════════════════
+#  内置重试
+# ═══════════════════════════════════════════════════════════
+
+
+class TestRetry:
+    def test_invoke_retries_until_success(self, fake_sdk, monkeypatch):
+        _, _ = fake_sdk
+        monkeypatch.setattr("agent_core.llm.time.sleep", lambda d: None)
+        llm = LLM("http://x", "k", "m", max_retries=3, base_delay=0)
+        # 前 2 次抛异常，第 3 次成功
+        llm.sync_client.add_response(RuntimeError("boom"))
+        llm.sync_client.add_response(RuntimeError("boom"))
+        llm.sync_client.add_response(make_response(content="ok"))
+
+        msg = llm.invoke([Message(role=Role.USER, content="x")])
+        assert msg.content == "ok"
+        assert len(llm.sync_client.calls) == 3
+
+    def test_invoke_exhaust_raises(self, fake_sdk, monkeypatch):
+        _, _ = fake_sdk
+        monkeypatch.setattr("agent_core.llm.time.sleep", lambda d: None)
+        llm = LLM("http://x", "k", "m", max_retries=2, base_delay=0)
+        for _ in range(5):
+            llm.sync_client.add_response(RuntimeError("boom"))
+
+        with pytest.raises(RuntimeError, match="boom"):
+            llm.invoke([Message(role=Role.USER, content="x")])
+        assert len(llm.sync_client.calls) == 3  # 首次 + 2 重试
+
+    @pytest.mark.asyncio
+    async def test_ainvoke_retries(self, fake_sdk):
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m", max_retries=3, base_delay=0)
+        llm.async_client.add_response(RuntimeError("boom"))
+        llm.async_client.add_response(make_response(content="ok"))
+        msg = await llm.ainvoke([Message(role=Role.USER, content="x")])
+        assert msg.content == "ok"
+        assert len(llm.async_client.calls) == 2
+
+    def test_retry_on_filter(self, fake_sdk, monkeypatch):
+        """不匹配 retry_on 的异常立即抛出。"""
+        _, _ = fake_sdk
+        monkeypatch.setattr("agent_core.llm.time.sleep", lambda d: None)
+        llm = LLM("http://x", "k", "m", max_retries=3, retry_on=(RuntimeError,), base_delay=0)
+        llm.sync_client.add_response(ValueError("wrong"))
+        with pytest.raises(ValueError):
+            llm.invoke([Message(role=Role.USER, content="x")])
+        assert len(llm.sync_client.calls) == 1  # 没重试
+
+    def test_max_retries_zero(self, fake_sdk):
+        """max_retries=0 表示不重试。"""
+        _, _ = fake_sdk
+        llm = LLM("http://x", "k", "m", max_retries=0)
+        llm.sync_client.add_response(make_response(content="ok"))
+        msg = llm.invoke([Message(role=Role.USER, content="x")])
+        assert msg.content == "ok"
+        assert len(llm.sync_client.calls) == 1
+
+
+# ═══════════════════════════════════════════════════════════
+#  懒加载
+# ═══════════════════════════════════════════════════════════
+
+
+class TestLazyLoad:
+    def test_sync_only_no_async_init(self, fake_sdk):
+        _, FakeAsync = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.sync_client.add_response(make_response(content="ok"))
+        llm.invoke([Message(role=Role.USER, content="x")])
+        # 只用了同步方法，不应初始化异步 client
+        assert len(FakeAsync.instances) == 0
+
+    @pytest.mark.asyncio
+    async def test_async_only_no_sync_init(self, fake_sdk):
+        FakeSync, _ = fake_sdk
+        llm = LLM("http://x", "k", "m")
+        llm.async_client.add_response(make_response(content="ok"))
+        await llm.ainvoke([Message(role=Role.USER, content="x")])
+        assert len(FakeSync.instances) == 0

@@ -77,4 +77,5 @@ data/
 logs/
 run.log          # 多模型测试运行日志（含 LLM 调用记录，不入库）
 run_p1.log       # P1 验证运行日志
+run_p2.log       # 统一接口验证运行日志
 *.log

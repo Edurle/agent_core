@@ -1,40 +1,40 @@
 """agent_core —— 通用 Agent 底层库。
 
-公共 API：统一消息模型、LLM 访问层、工具系统、Agent 主循环。
+统一接口：每个核心组件（Agent / LLM）都提供四个方法：
+  invoke   同步非流式
+  ainvoke  异步非流式（工具并行）
+  stream   同步流式
+  astream  异步流式
 
 快速开始::
 
-    from agent_core import Agent, OpenAICompatibleClient, ToolRegistry, tool
+    from agent_core import Agent, LLM, ToolRegistry, tool
 
     @tool
     def add(a: int, b: int) -> int:
-        \"\"\"两数相加\"\"\"
+        \"\"\"两数相加。\"\"\"
         return a + b
 
     tools = ToolRegistry()
     tools.register(add)
 
-    llm = OpenAICompatibleClient(
+    llm = LLM(
         base_url="https://api.deepseek.com/v1",
         api_key="sk-xxx",
         model="deepseek-chat",
     )
     agent = Agent(llm=llm, tools=tools, system_prompt="你是一个会用工具的助手")
-    print(agent.run("3 加 5 是多少？"))
+
+    # 四种调用方式
+    print(agent.invoke("3 加 5 是多少？"))           # 同步非流式
+    print(await agent.ainvoke("3 加 5 是多少？"))    # 异步非流式
+    for ev in agent.stream("写一首诗"): ...          # 同步流式
+    async for ev in agent.astream("写一首诗"): ...   # 异步流式
 """
 
 from .agent import Agent
-from .async_api import (
-    AsyncAgent,
-    AsyncLLMClient,
-    AsyncOpenAICompatibleClient,
-    AsyncRetryLLM,
-    AsyncToolRegistry,
-)
-from .llm import LLMClient, OpenAICompatibleClient
+from .llm import LLM, LLMProtocol
 from .messages import Message, Role, StreamEvent, ToolCall, assistant, system, tool_result, user
-from .retry import RetryLLM
-from .streaming import StreamingLLM
 from .tools import Tool, ToolRegistry, tool
 
 __all__ = [
@@ -47,23 +47,15 @@ __all__ = [
     "user",
     "assistant",
     "tool_result",
-    # LLM
-    "LLMClient",
-    "OpenAICompatibleClient",
-    "StreamingLLM",
-    "RetryLLM",
+    # LLM（统一：invoke/ainvoke/stream/astream）
+    "LLM",
+    "LLMProtocol",
     # 工具
     "Tool",
     "ToolRegistry",
     "tool",
-    # Agent
+    # Agent（统一：invoke/ainvoke/stream/astream）
     "Agent",
-    # 异步 API（双轨）
-    "AsyncLLMClient",
-    "AsyncOpenAICompatibleClient",
-    "AsyncRetryLLM",
-    "AsyncToolRegistry",
-    "AsyncAgent",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

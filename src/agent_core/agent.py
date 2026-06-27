@@ -1,201 +1,220 @@
-"""Agent 主循环。
+"""Agent 主循环（统一接口）。
 
-协调 LLM 与工具，实现 ReAct 范式的"思考 -> 行动 -> 观察"循环：
-调 LLM -> 解析 tool_calls -> 执行工具 -> 结果回填 -> 继续，
+提供统一的 ``Agent`` 组件，一个对象支持四种调用方式：
+  ``invoke``   同步非流式 → 返回最终文本
+  ``ainvoke``  异步非流式 → 返回最终文本（工具并行执行）
+  ``stream``   同步流式   → 产出 StreamEvent 迭代器
+  ``astream``  异步流式   → 产出 StreamEvent 异步迭代器（工具并行）
+
+ReAct 范式循环：调 LLM → 解析 tool_calls → 执行工具 → 结果回填 → 继续，
 直到 LLM 不再请求工具（给出最终答案）或达到最大迭代数。
 
-设计原则：
-- 显式优于隐式：核心循环清晰可读，约 20 行。
-- 每轮 LLM 响应（含 tool_calls）都记入历史，工具结果回填 role=tool 消息。
-- 终止条件只看 tool_calls 是否为空（跨平台最稳），不看 finish_reason。
+设计要点：
+- 核心循环逻辑去重：消息组装、终止判断、回填逻辑共享，
+  sync/async + stream/非stream 只是不同的"消费外壳"。
+- 终止条件只看 tool_calls 是否为空（跨平台最稳）。
+- 每轮 LLM 响应（含 tool_calls）都记入历史。
 - 防死循环：max_iterations 上限。
 """
 
 from __future__ import annotations
 
-from typing import Iterator
+from typing import Any, AsyncIterator, Iterator
 
-from .llm import LLMClient
+from .llm import LLMProtocol
 from .messages import Message, Role, StreamEvent
 from .tools import ToolRegistry
 
-# 达到最大迭代时的兜底回复
 _MAX_ITERATIONS_MESSAGE = "[agent 达到最大迭代次数，未给出最终回复]"
 
 
 class Agent:
-    """一个最小可用的工具调用 Agent。
+    """统一的工具调用 Agent。一个对象支持四种调用方式。
 
     Args:
-        llm: LLM 客户端（实现 LLMClient 协议）。
-        tools: 工具注册表。无工具时传空 ToolRegistry()。
+        llm: LLM 组件（实现 LLMProtocol，有 invoke/ainvoke/stream/astream）。
+        tools: 工具注册表。无工具时传 ToolRegistry() 或 None。
         system_prompt: 系统提示词，空字符串则不加 system 消息。
         max_iterations: 最大循环轮数，防止死循环。默认 10。
 
-    Example:
-        >>> from agent_core import Agent, OpenAICompatibleClient, ToolRegistry
-        >>> llm = OpenAICompatibleClient(
-        ...     base_url="https://api.deepseek.com/v1",
-        ...     api_key="sk-xxx", model="deepseek-chat",
-        ... )
-        >>> tools = ToolRegistry()
-        >>> agent = Agent(llm=llm, tools=tools, system_prompt="你是助手")
-        >>> agent.run("你好")   # doctest: +SKIP
+    四种调用方式::
+
+        answer = agent.invoke("你好")                 # 同步非流式
+        answer = await agent.ainvoke("你好")           # 异步非流式（工具并行）
+        for ev in agent.stream("写一首诗"): ...        # 同步流式
+        async for ev in agent.astream("写一首诗"): ...  # 异步流式
     """
 
     def __init__(
         self,
-        llm: LLMClient,
-        tools: ToolRegistry,
+        llm: LLMProtocol,
+        tools: ToolRegistry | None = None,
         system_prompt: str = "",
         max_iterations: int = 10,
     ):
         self.llm = llm
-        self.tools = tools
+        self.tools = tools or ToolRegistry()
         self.system_prompt = system_prompt
         self.max_iterations = max_iterations
 
-    def run(self, user_input: str) -> str:
-        """运行一轮 agent，返回最终文本回复。
+    # ── 共享：组装初始消息 ───────────────────────────────────
 
-        Args:
-            user_input: 用户这一轮的输入。
-
-        Returns:
-            agent 的最终文本回复。达到 max_iterations 仍未结束时返回兜底字符串。
-        """
+    def _init_messages(self, user_input: str) -> list[Message]:
         messages: list[Message] = []
         if self.system_prompt:
             messages.append(Message(role=Role.SYSTEM, content=self.system_prompt))
         messages.append(Message(role=Role.USER, content=user_input))
+        return messages
 
-        # 工具 schema：有工具才传，避免给 LLM 发空列表
-        tool_schemas = self.tools.to_schemas() or None
+    @property
+    def _tool_schemas(self) -> list[dict] | None:
+        return self.tools.to_schemas() or None
 
-        assistant_msg: Message | None = None
+    # ═══════════════════════════════════════════════════════════
+    #  invoke：同步非流式
+    # ═══════════════════════════════════════════════════════════
 
-        for _ in range(self.max_iterations):
-            # 1. 调 LLM
-            assistant_msg = self.llm.chat(messages, tools=tool_schemas)
-            messages.append(assistant_msg)
-
-            # 2. 无 tool_calls => 给出最终答案，结束
-            if not assistant_msg.tool_calls:
-                return assistant_msg.content or ""
-
-            # 3. 执行所有工具调用，回填 role=tool 结果
-            #    并行工具调用也只是循环逐个执行（P0 同步）
-            for call in assistant_msg.tool_calls:
-                result = self.tools.execute(call.name, call.arguments)
-                messages.append(
-                    Message(
-                        role=Role.TOOL,
-                        content=result,
-                        tool_call_id=call.id,
-                        name=call.name,
-                    )
-                )
-
-        # 达到最大迭代仍未结束
-        if assistant_msg is not None and assistant_msg.content:
-            return assistant_msg.content
-        return _MAX_ITERATIONS_MESSAGE
-
-    def chat(self, messages: list[Message]) -> str:
-        """基于既有消息历史跑一轮（多轮对话场景）。
-
-        与 run() 的区别：接受外部传入的完整消息历史，便于上层维护多轮状态。
-        run() 每次内部新建历史；chat() 把历史管理权交给调用方。
-
-        Args:
-            messages: 既有对话历史（会被原地追加，调用方持有引用）。
-
-        Returns:
-            agent 的最终文本回复。
-        """
-        tool_schemas = self.tools.to_schemas() or None
-        assistant_msg: Message | None = None
+    def invoke(self, input: str) -> str:
+        """同步非流式运行。完整跑完返回最终文本。"""
+        messages = self._init_messages(input)
+        tool_schemas = self._tool_schemas
+        last_content: str = ""
 
         for _ in range(self.max_iterations):
-            assistant_msg = self.llm.chat(messages, tools=tool_schemas)
+            assistant_msg = self.llm.invoke(messages, tools=tool_schemas)
             messages.append(assistant_msg)
-
             if not assistant_msg.tool_calls:
                 return assistant_msg.content or ""
-
+            last_content = assistant_msg.content or last_content
+            # 同步逐个执行工具
             for call in assistant_msg.tool_calls:
                 result = self.tools.execute(call.name, call.arguments)
-                messages.append(
-                    Message(
-                        role=Role.TOOL,
-                        content=result,
-                        tool_call_id=call.id,
-                        name=call.name,
-                    )
-                )
+                messages.append(_tool_msg(result, call))
 
-        if assistant_msg is not None and assistant_msg.content:
-            return assistant_msg.content
-        return _MAX_ITERATIONS_MESSAGE
+        return last_content or _MAX_ITERATIONS_MESSAGE
 
-    def run_stream(self, user_input: str) -> Iterator[StreamEvent]:
-        """流式版主循环。
+    # ═══════════════════════════════════════════════════════════
+    #  ainvoke：异步非流式（工具并行）
+    # ═══════════════════════════════════════════════════════════
 
-        要求注入的 ``self.llm`` 提供 ``chat_stream()`` 方法（如 StreamingLLM）。
-        每轮 LLM 调用逐 token 产出 ``token`` 事件；工具结果作为 ``tool_result`` 事件产出；
-        多轮工具调用时，中间轮的 done 不外抛（避免提前结束），
+    async def ainvoke(self, input: str) -> str:
+        """异步非流式运行。同一轮多个 tool_calls 用 asyncio.gather 并行执行。"""
+        messages = self._init_messages(input)
+        tool_schemas = self._tool_schemas
+        last_content: str = ""
+
+        for _ in range(self.max_iterations):
+            assistant_msg = await self.llm.ainvoke(messages, tools=tool_schemas)
+            messages.append(assistant_msg)
+            if not assistant_msg.tool_calls:
+                return assistant_msg.content or ""
+            last_content = assistant_msg.content or last_content
+            # 并行执行本轮所有工具调用
+            results = await self.tools.aexecute_many(assistant_msg.tool_calls)
+            for call, result in zip(assistant_msg.tool_calls, results):
+                messages.append(_tool_msg(result, call))
+
+        return last_content or _MAX_ITERATIONS_MESSAGE
+
+    # ═══════════════════════════════════════════════════════════
+    #  stream：同步流式
+    # ═══════════════════════════════════════════════════════════
+
+    def stream(self, input: str) -> Iterator[StreamEvent]:
+        """同步流式运行。逐 token 产出事件。
+
+        每轮 LLM 调用逐 token 产出 ``token`` 事件；工具结果作为 ``tool_result`` 事件；
         仅在最终给出答案时产出 ``done`` 事件。
-
-        Yields:
-            StreamEvent —— token / tool_call / tool_result / done。
         """
-        messages: list[Message] = []
-        if self.system_prompt:
-            messages.append(Message(role=Role.SYSTEM, content=self.system_prompt))
-        messages.append(Message(role=Role.USER, content=user_input))
-
-        tool_schemas = self.tools.to_schemas() or None
+        messages = self._init_messages(input)
+        tool_schemas = self._tool_schemas
 
         for _ in range(self.max_iterations):
-            assistant_msg: Message | None = None
-
-            # 1. 流式调 LLM：透传 token，累积出完整 assistant_msg
-            for event in self.llm.chat_stream(messages, tools=tool_schemas):
-                if event.type == "token":
-                    yield event
-                elif event.type == "tool_call":
-                    yield event
-                elif event.type == "done":
-                    assistant_msg = event.final
-
-            # done 事件保证 assistant_msg 非空
-            assert assistant_msg is not None
+            # 流式调 LLM：透传 token/tool_call，累积出 final
+            assistant_msg = yield from _collect_stream_final(
+                self.llm.stream(messages, tools=tool_schemas)
+            )
             messages.append(assistant_msg)
 
-            # 2. 无 tool_calls => 最终答案，产出 done 结束
             if not assistant_msg.tool_calls:
                 yield StreamEvent(type="done", final=assistant_msg)
                 return
 
-            # 3. 执行所有工具调用，回填并产出 tool_result 事件
+            # 同步逐个执行工具，产出 tool_result 事件
             for call in assistant_msg.tool_calls:
                 result = self.tools.execute(call.name, call.arguments)
-                messages.append(
-                    Message(
-                        role=Role.TOOL,
-                        content=result,
-                        tool_call_id=call.id,
-                        name=call.name,
-                    )
-                )
-                yield StreamEvent(
-                    type="tool_result",
-                    content=result,
-                    call_id=call.id,
-                )
+                messages.append(_tool_msg(result, call))
+                yield StreamEvent(type="tool_result", content=result, call_id=call.id)
 
-        # 达到最大迭代仍未结束
-        yield StreamEvent(
-            type="done",
-            final=Message(role=Role.ASSISTANT, content=_MAX_ITERATIONS_MESSAGE),
-        )
+        yield StreamEvent(type="done", final=Message(role=Role.ASSISTANT, content=_MAX_ITERATIONS_MESSAGE))
+
+    # ═══════════════════════════════════════════════════════════
+    #  astream：异步流式（工具并行）
+    # ═══════════════════════════════════════════════════════════
+
+    async def astream(self, input: str) -> AsyncIterator[StreamEvent]:
+        """异步流式运行。逐 token 产出事件，工具并行执行。
+
+        用 ``async for event in agent.astream(...)`` 消费。
+
+        与同步 stream 不同：异步无法用 yield from 委托事件透传，
+        故 token/tool_call 透传逻辑在此内联，同时收集 done 里的 final Message。
+        """
+        messages = self._init_messages(input)
+        tool_schemas = self._tool_schemas
+
+        for _ in range(self.max_iterations):
+            # 异步消费 LLM 流：透传 token/tool_call，收集 final
+            assistant_msg: Message | None = None
+            async for event in self.llm.astream(messages, tools=tool_schemas):
+                if event.type == "done":
+                    assistant_msg = event.final
+                else:
+                    yield event
+            assert assistant_msg is not None, "LLM 流未产出 done 事件"
+            messages.append(assistant_msg)
+
+            if not assistant_msg.tool_calls:
+                yield StreamEvent(type="done", final=assistant_msg)
+                return
+
+            # 并行执行工具，然后逐个产出 tool_result 事件
+            results = await self.tools.aexecute_many(assistant_msg.tool_calls)
+            for call, result in zip(assistant_msg.tool_calls, results):
+                messages.append(_tool_msg(result, call))
+                yield StreamEvent(type="tool_result", content=result, call_id=call.id)
+
+        yield StreamEvent(type="done", final=Message(role=Role.ASSISTANT, content=_MAX_ITERATIONS_MESSAGE))
+
+
+# ═══════════════════════════════════════════════════════════
+#  内部辅助
+# ═══════════════════════════════════════════════════════════
+
+
+def _tool_msg(result: str, call: Any) -> Message:
+    """构造工具结果回填消息。"""
+    return Message(
+        role=Role.TOOL,
+        content=result,
+        tool_call_id=call.id,
+        name=call.name,
+    )
+
+
+def _collect_stream_final(event_iter: Iterator[StreamEvent]) -> Iterator[StreamEvent]:
+    """消费同步事件流，透传 token/tool_call 事件，返回 final Message。
+
+    用法：``final = yield from _collect_stream_final(llm.stream(...))``
+    done 事件里的 final Message 被提取返回，done 事件本身不透传。
+    异步版本无法用 yield from 委托，透传逻辑在 Agent.astream 中内联。
+    """
+    final: Message | None = None
+    for event in event_iter:
+        if event.type == "done":
+            final = event.final
+            # done 事件不透传（由调用方决定何时产出）
+        else:
+            yield event
+    assert final is not None, "事件流未产出 done 事件"
+    return final
