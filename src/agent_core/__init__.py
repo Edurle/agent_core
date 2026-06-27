@@ -37,6 +37,15 @@ from .llm import LLM, LLMProtocol
 from .messages import Message, Role, StreamEvent, ToolCall, assistant, system, tool_result, user
 from .tools import Tool, ToolRegistry, tool
 
+# MCP 是可选依赖：未安装 mcp SDK 时跳过导出，核心功能不受影响。
+# 用户使用 MCPClient 需先 pip install mcp>=1.2
+try:
+    from .mcp import MCPClient, MCPTool, MCPToolInfo
+    _MCP_AVAILABLE = True
+except ImportError:  # mcp SDK 未安装
+    MCPClient = MCPTool = MCPToolInfo = None  # type: ignore[assignment,misc]
+    _MCP_AVAILABLE = False
+
 __all__ = [
     # 消息模型
     "Message",
@@ -56,6 +65,10 @@ __all__ = [
     "tool",
     # Agent（统一：invoke/ainvoke/stream/astream）
     "Agent",
+    # MCP（可选）
+    "MCPClient",
+    "MCPTool",
+    "MCPToolInfo",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"

@@ -1,6 +1,10 @@
-# agent_core 运行时依赖
+# agent_core 运行时依赖（核心）
 openai>=1.0
 pydantic>=2.0
+
+# 可选依赖：MCP 集成（用 MCPClient 时才需要）
+# pip install mcp>=1.2
+# mcp>=1.2
 
 # 开发依赖（开发/测试时安装）
 # pytest>=8.0

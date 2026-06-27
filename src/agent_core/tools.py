@@ -25,6 +25,7 @@ from .messages import ToolCall
 
 if TYPE_CHECKING:
     from pydantic import BaseModel
+    from .mcp import MCPClient, MCPTool
 
 
 class Tool:
@@ -70,10 +71,28 @@ class Tool:
 
         对 pydantic_models 中登记的参数，先做 Model(**value) 校验再传入。
         校验失败抛 ValidationError，由 ToolRegistry.execute 捕获转错误字符串。
+
+        异步工具（MCPTool）不支持 run，会抛 NotImplementedError。
         """
         call_kwargs = self._resolve_pydantic_params(kwargs)
         result = self.func(**call_kwargs)
         return self._stringify(result)
+
+    async def acall(self, **kwargs: Any) -> str:
+        """执行工具函数（异步），返回值 stringify 为字符串。
+
+        对协程函数工具：构造 pydantic 参数后 await。
+        MCPTool 等纯异步工具会重写本方法（不经 func）。
+
+        对同步 func 工具：通常不应走 acall（aexecute 会丢线程池调 run）。
+        若直接调本方法且 func 是同步的，则在线程池执行。
+        """
+        if self.is_async():
+            call_kwargs = self._resolve_pydantic_params(kwargs)
+            result = await self.func(**call_kwargs)
+            return self._stringify(result)
+        # 同步 func：丢线程池避免阻塞
+        return await asyncio.to_thread(self.run, **kwargs)
 
     def _resolve_pydantic_params(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """把 dict 形式的 pydantic 参数构造为模型实例（校验）。
@@ -89,7 +108,11 @@ class Tool:
         return call_kwargs
 
     def is_async(self) -> bool:
-        """工具函数是否是协程函数。"""
+        """工具是否是异步工具（协程函数工具或 MCPTool 等）。
+
+        ToolRegistry.aexecute 据此决定走 acall（异步）还是 run（线程池）。
+        子类（如 MCPTool）可重写返回 True。
+        """
         return inspect.iscoroutinefunction(self.func)
 
     def to_schema(self) -> dict:
@@ -159,20 +182,15 @@ class ToolRegistry:
     async def aexecute(self, name: str, arguments: dict) -> str:
         """按名查找并异步执行工具。
 
-        - 协程函数工具：直接 await（先构造 pydantic 参数）。
-        - 同步函数工具：丢到线程池（asyncio.to_thread），避免阻塞事件循环。
+        统一走 ``tool.acall``：
+        - 协程函数工具 / MCPTool：acall 直接 await。
+        - 同步函数工具：acall 内部丢线程池（asyncio.to_thread），避免阻塞事件循环。
 
         工具异常被捕获返回错误字符串（ReAct 语义，与 execute 一致）。
         """
         tool = self.get(name)
         try:
-            if tool.is_async():
-                # 协程工具：构造 pydantic 参数后 await
-                call_kwargs = tool._resolve_pydantic_params(arguments)
-                result = await tool.func(**call_kwargs)
-                return Tool._stringify(result)
-            # 同步工具：丢线程池
-            return await asyncio.to_thread(tool.run, **arguments)
+            return await tool.acall(**arguments)
         except Exception as e:  # noqa: BLE001
             return f"[工具执行错误: {type(e).__name__}: {e}]"
 
@@ -180,6 +198,32 @@ class ToolRegistry:
         """并行执行多个工具调用（asyncio.gather），返回与 calls 顺序对应的结果列表。"""
         tasks = [self.aexecute(c.name, c.arguments) for c in calls]
         return await asyncio.gather(*tasks)
+
+    async def aregister_mcp(self, client: "MCPClient") -> list["MCPTool"]:
+        """把一个 MCP server 的所有工具注册进来。
+
+        会先 ``await client.list_tools()`` 发现工具，然后每个包装成 MCPTool 注册。
+        返回注册的工具列表。
+
+        MCP 工具是异步的，注册后只能通过 Agent.ainvoke / astream 调用。
+        """
+        # 延迟导入避免循环依赖
+        from .mcp import MCPTool
+
+        infos = await client.list_tools()
+        registered: list[MCPTool] = []
+        for info in infos:
+            tool = MCPTool(client=client, info=info)
+            try:
+                self.register(tool)
+                registered.append(tool)
+            except ValueError:
+                # 重名工具跳过（避免一个 server 重复注册报错）
+                import logging
+                logging.getLogger("agent_core.tools").warning(
+                    "MCP 工具 '%s' 与已有工具重名，跳过", info.name
+                )
+        return registered
 
 
 # ── @tool 装饰器（P0 简化版）─────────────────────────────────
