@@ -47,9 +47,11 @@ from .hook import (
     ToolEndEvent,
     ToolErrorEvent,
     ToolStartEvent,
+    ToolWriterEvent,
 )
 from .llm import LLM, LLMProtocol
 from .messages import Message, Role, StreamEvent, ToolCall, assistant, system, tool_result, user
+from .runtime import StreamWriter, ToolRuntime
 from .state import AgentState
 from .tools import Tool, ToolRegistry, tool
 from .trace import Span, Trace, TraceCollector
@@ -82,8 +84,10 @@ __all__ = [
     "tool",
     # Agent（统一：invoke/ainvoke/stream/astream）
     "Agent",
-    # 共享状态
+    # 共享状态 + 工具运行时
     "AgentState",
+    "ToolRuntime",
+    "StreamWriter",
     # Hook（方案 A，事件回调）
     "Hook",
     "HookEvent",
@@ -98,6 +102,7 @@ __all__ = [
     "ToolStartEvent",
     "ToolEndEvent",
     "ToolErrorEvent",
+    "ToolWriterEvent",
     # Trace（基于 hook 汇聚）
     "Span",
     "Trace",

@@ -86,13 +86,11 @@ class Agent:
             self.llm.hooks = self.hooks  # type: ignore[attr-defined]
 
     def _resolve_state(self, state: dict | None) -> dict:
-        """解析本次 run 的 state。
+        """解析本次 run 的 agent_state（runtime.agent_state 用它）。
 
         - state 显式传入：**直接用该 dict 对象**（保持引用，工具的修改反映在用户的 dict 上）。
         - state 为 None：用 default_state 的深拷贝副本（避免污染默认值）。
         - 都没有：返回空 AgentState。
-
-        返回的是 dict（鸭子类型），工具签名标注 state: AgentState 只是类型提示。
         """
         from .state import AgentState
         if state is not None:
@@ -102,6 +100,67 @@ class Agent:
             import copy
             return copy.deepcopy(self.default_state)
         return AgentState()
+
+    def _make_runtime(self, tool_name: str, agent_state: dict):
+        """构造 ToolRuntime（含 stream_writer），同步路径。
+
+        stream_writer 调用时触发 on_tool_writer 事件（绕过 LLM）。
+        """
+        from .hook import ToolWriterEvent
+        from .runtime import StreamWriter, ToolRuntime
+
+        def _emit(text: str) -> None:
+            self.hooks.emit(ToolWriterEvent(type="on_tool_writer", name=tool_name, text=text))
+
+        return ToolRuntime(agent_state=agent_state, stream_writer=StreamWriter(_emit))
+
+    def _make_runtime_with_buffer(self, tool_name: str, agent_state: dict):
+        """构造 ToolRuntime（含 stream_writer），流式路径用——额外返回输出缓冲。
+
+        流式路径下 stream_writer 无法直接 yield StreamEvent，故缓冲到列表，
+        工具执行完再批量 yield。返回 (runtime, buffer)。
+        """
+        from .hook import ToolWriterEvent
+        from .runtime import StreamWriter, ToolRuntime
+
+        buffer: list[str] = []
+
+        def _emit(text: str) -> None:
+            self.hooks.emit(ToolWriterEvent(type="on_tool_writer", name=tool_name, text=text))
+            buffer.append(text)
+
+        runtime = ToolRuntime(agent_state=agent_state, stream_writer=StreamWriter(_emit))
+        return runtime, buffer
+
+    async def _amake_runtime(self, tool_name: str, agent_state: dict):
+        """构造 ToolRuntime（含 stream_writer），异步路径用。
+
+        stream_writer 调用时触发 on_tool_writer 事件（aemit）。
+        """
+        from .hook import ToolWriterEvent
+        from .runtime import StreamWriter, ToolRuntime
+
+        def _emit(text: str) -> None:
+            # 异步路径用 aemit；stream_writer 是同步回调，事件用 aemit 触发
+            # 注意：aemit 是 async，但 stream_writer 是同步 __call__，无法 await。
+            # 异步路径的 on_tool_writer 事件用 emit（同步触发，协程 hook 走 asyncio.run）
+            self.hooks.emit(ToolWriterEvent(type="on_tool_writer", name=tool_name, text=text))
+
+        return ToolRuntime(agent_state=agent_state, stream_writer=StreamWriter(_emit))
+
+    def _amake_runtime_with_buffer(self, tool_name: str, agent_state: dict):
+        """构造 ToolRuntime（含 stream_writer），异步流式路径用——额外返回输出缓冲。"""
+        from .hook import ToolWriterEvent
+        from .runtime import StreamWriter, ToolRuntime
+
+        buffer: list[str] = []
+
+        def _emit(text: str) -> None:
+            self.hooks.emit(ToolWriterEvent(type="on_tool_writer", name=tool_name, text=text))
+            buffer.append(text)
+
+        runtime = ToolRuntime(agent_state=agent_state, stream_writer=StreamWriter(_emit))
+        return runtime, buffer
 
     # ── 共享：组装初始消息 ───────────────────────────────────
 
@@ -172,7 +231,8 @@ class Agent:
                 answer = last_content
                 # 同步逐个执行工具
                 for call in assistant_msg.tool_calls:
-                    result = self.tools.execute(call.name, call.arguments, state=run_state)
+                    runtime = self._make_runtime(call.name, run_state)
+                    result = self.tools.execute(call.name, call.arguments, runtime=runtime)
                     messages.append(_tool_msg(result, call))
             else:
                 answer = last_content or _MAX_ITERATIONS_MESSAGE
@@ -221,8 +281,12 @@ class Agent:
                     break
                 last_content = assistant_msg.content or last_content
                 answer = last_content
-                # 并行执行本轮所有工具调用（共享同一 run_state）
-                results = await self.tools.aexecute_many(assistant_msg.tool_calls, state=run_state)
+                # 并行执行本轮所有工具调用（共享同一 run_state，各 call 自己的 runtime）
+                import asyncio as _aio
+                async def _run_one(c):
+                    rt = await self._amake_runtime(c.name, run_state)
+                    return await self.tools.aexecute(c.name, c.arguments, runtime=rt)
+                results = await _aio.gather(*[_run_one(c) for c in assistant_msg.tool_calls])
                 for call, result in zip(assistant_msg.tool_calls, results):
                     messages.append(_tool_msg(result, call))
             else:
@@ -281,10 +345,14 @@ class Agent:
                     yield final_event
                     return
 
-                # 同步逐个执行工具，产出 tool_result 事件
+                # 同步逐个执行工具，产出 tool_writer + tool_result 事件
                 for call in assistant_msg.tool_calls:
-                    result = self.tools.execute(call.name, call.arguments, state=run_state)
+                    runtime, writer_buf = self._make_runtime_with_buffer(call.name, run_state)
+                    result = self.tools.execute(call.name, call.arguments, runtime=runtime)
                     messages.append(_tool_msg(result, call))
+                    # 先产出 stream_writer 的输出（工具执行期间缓冲的）
+                    for text in writer_buf:
+                        yield StreamEvent(type="tool_writer", content=text, call_id=call.id)
                     yield StreamEvent(type="tool_result", content=result, call_id=call.id)
         except Exception as e:
             error = e
@@ -338,10 +406,17 @@ class Agent:
                     yield StreamEvent(type="done", final=assistant_msg)
                     return
 
-                # 并行执行工具，然后逐个产出 tool_result 事件
-                results = await self.tools.aexecute_many(assistant_msg.tool_calls, state=run_state)
-                for call, result in zip(assistant_msg.tool_calls, results):
+                # 并行执行工具（各 call 自己的 runtime + 缓冲），然后逐个产出事件
+                import asyncio as _aio2
+                async def _run_one_stream(c):
+                    rt, buf = self._amake_runtime_with_buffer(c.name, run_state)
+                    res = await self.tools.aexecute(c.name, c.arguments, runtime=rt)
+                    return res, buf
+                pairs = await _aio2.gather(*[_run_one_stream(c) for c in assistant_msg.tool_calls])
+                for call, (result, writer_buf) in zip(assistant_msg.tool_calls, pairs):
                     messages.append(_tool_msg(result, call))
+                    for text in writer_buf:
+                        yield StreamEvent(type="tool_writer", content=text, call_id=call.id)
                     yield StreamEvent(type="tool_result", content=result, call_id=call.id)
         except Exception as e:
             await self.hooks.aemit(ChainEndEvent(

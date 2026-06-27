@@ -164,6 +164,17 @@ class ToolErrorEvent(HookEvent):
     error: str = ""
 
 
+@dataclass
+class ToolWriterEvent(HookEvent):
+    """on_tool_writer：工具 stream_writer 的实时输出（绕过 LLM）。
+
+    工具执行过程中调 ``runtime.stream_writer(text)`` 即触发，内容不走 LLM，
+    通过独立通道（hook 事件 / StreamEvent）给调用方。工具最终 return 仍正常回填 LLM。
+    """
+    name: str = ""        # 工具名
+    text: str = ""        # 输出内容
+
+
 # ═══════════════════════════════════════════════════════════
 #  HookRegistry：sync/async 双路径分发
 # ═══════════════════════════════════════════════════════════

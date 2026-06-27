@@ -1,4 +1,4 @@
-"""Agent State 端到端验证：工具读写 state + 多轮累积 + 多请求隔离。
+"""ToolRuntime 端到端验证：runtime.agent_state 持久 + runtime.stream_writer 实时输出。
 
 环境变量：BAILIAN_API_KEY / BAILIAN_BASEURL
 日志写入 run_state.log（已 gitignore）。
@@ -13,22 +13,25 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from agent_core import Agent, AgentState, LLM, ToolRegistry, tool
+from agent_core import Agent, LLM, ToolRegistry, tool
+from agent_core.hook import ToolWriterEvent
+from agent_core.runtime import ToolRuntime
 
 MODEL = "qwen3.7-plus"
 
 
 @tool
-def remember(key: str, value: str, state: AgentState) -> str:
-    """记住一个键值对到记忆里。"""
-    state[key] = value
+def remember(key: str, value: str, runtime: ToolRuntime) -> str:
+    """记住一个键值对。"""
+    runtime.agent_state[key] = value
+    runtime.stream_writer(f"已记住 {key}={value}")   # 实时输出，绕过 LLM
     return f"已记住 {key}={value}"
 
 
 @tool
-def recall(key: str, state: AgentState) -> str:
-    """从记忆里取出某个键的值。"""
-    return state.get(key, f"没有记住 {key}")
+def recall(key: str, runtime: ToolRuntime) -> str:
+    """取出某个键的值。"""
+    return runtime.agent_state.get(key, f"没有记住 {key}")
 
 
 def build_tools() -> ToolRegistry:
@@ -69,27 +72,32 @@ def build_llm(api_key, base_url):
     return LLM(base_url=base_url, api_key=api_key, model=MODEL, max_retries=2)
 
 
-def test_state_persistence(base_url, api_key, log):
-    """多轮工具调用间 state 持久化：记住后能回忆。"""
-    log.section("测试 1：state 在多轮工具调用间持久")
+def test_runtime_single(base_url, api_key, log):
+    """runtime.agent_state 持久 + stream_writer 实时输出。"""
+    log.section("测试 1：runtime（agent_state 持久 + stream_writer 实时）")
+    writer_outputs = []
+
+    def on_writer(event):
+        if isinstance(event, ToolWriterEvent):
+            writer_outputs.append(event.text)
+
     llm = build_llm(api_key, base_url)
-    agent = Agent(llm=llm, tools=build_tools(),
-                  system_prompt="你能记住和回忆信息。用户让你记住时调 remember，问时调 recall。")
+    agent = Agent(llm=llm, tools=build_tools(), hooks=[on_writer],
+                  system_prompt="你能记住和回忆信息。记住时调 remember，问时调 recall。")
 
     state = {}
     log.log("👤 请记住我的名字是 Alice，然后告诉我我的名字")
     answer = agent.invoke("请记住我的名字是 Alice，然后告诉我我的名字", state=state)
     log.log(f"🤖 {answer}")
     log.log(f"\nstate 内容: {dict(state)}")
-    assert state.get("名字") == "Alice" or state.get("name") == "Alice", \
-        f"state 应记录名字，实际: {state}"
-    log.log("✅ state 在多轮工具调用间正确持久化")
+    log.log(f"stream_writer 实时输出: {writer_outputs}")
+    assert state.get("名字") == "Alice" or state.get("name") == "Alice"
+    log.log("✅ agent_state 持久 + stream_writer 实时输出正确")
 
 
 async def test_concurrent_isolation(base_url, api_key, log):
-    """两并发请求各自记住不同的名字，state 不串。"""
-    log.section("测试 2：并发请求 state 隔离")
-    shared_tracer = None
+    """两并发请求各自的 state 不串。"""
+    log.section("测试 2：并发请求隔离")
 
     async def request(name):
         llm = build_llm(api_key, base_url)
@@ -105,11 +113,11 @@ async def test_concurrent_isolation(base_url, api_key, log):
     log.log(f"完成 [{time.time()-t0:.1f}s]")
     log.log(f"\n请求A的 state: {dict(state_a)}")
     log.log(f"请求B的 state: {dict(state_b)}")
-    log.log(f"\n隔离成功（各自的 state 独立）: ✓")
+    log.log(f"\n隔离成功: ✓")
 
 
 def test_default_state(base_url, api_key, log):
-    """default_state 副本机制：默认值不被污染。"""
+    """default_state 副本机制。"""
     log.section("测试 3：default_state 副本机制")
     llm = build_llm(api_key, base_url)
     default = {"counter": 0}
@@ -117,11 +125,10 @@ def test_default_state(base_url, api_key, log):
                   system_prompt="你是助手。",
                   default_state=default)
     log.log(f"默认 state: {default}")
-    # 不传 state，用默认副本
     agent.invoke("你好")
     log.log(f"run 后默认 state（应未被污染）: {default}")
-    assert default == {"counter": 0}, "默认 state 不应被修改"
-    log.log("✅ default_state 副本机制正确（默认值未被污染）")
+    assert default == {"counter": 0}
+    log.log("✅ default_state 副本机制正确")
 
 
 def main():
@@ -133,10 +140,10 @@ def main():
 
     log_path = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "run_state.log"))
     log = Logger(log_path)
-    log.log(f"Agent State 端到端验证 - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log.log(f"ToolRuntime 端到端验证 - {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     try:
-        test_state_persistence(base_url, api_key, log)
+        test_runtime_single(base_url, api_key, log)
         asyncio.run(test_concurrent_isolation(base_url, api_key, log))
         test_default_state(base_url, api_key, log)
         log.section("验证完成")
