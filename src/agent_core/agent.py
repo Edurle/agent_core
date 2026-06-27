@@ -13,8 +13,10 @@
 
 from __future__ import annotations
 
+from typing import Iterator
+
 from .llm import LLMClient
-from .messages import Message, Role
+from .messages import Message, Role, StreamEvent
 from .tools import ToolRegistry
 
 # 达到最大迭代时的兜底回复
@@ -135,3 +137,65 @@ class Agent:
         if assistant_msg is not None and assistant_msg.content:
             return assistant_msg.content
         return _MAX_ITERATIONS_MESSAGE
+
+    def run_stream(self, user_input: str) -> Iterator[StreamEvent]:
+        """流式版主循环。
+
+        要求注入的 ``self.llm`` 提供 ``chat_stream()`` 方法（如 StreamingLLM）。
+        每轮 LLM 调用逐 token 产出 ``token`` 事件；工具结果作为 ``tool_result`` 事件产出；
+        多轮工具调用时，中间轮的 done 不外抛（避免提前结束），
+        仅在最终给出答案时产出 ``done`` 事件。
+
+        Yields:
+            StreamEvent —— token / tool_call / tool_result / done。
+        """
+        messages: list[Message] = []
+        if self.system_prompt:
+            messages.append(Message(role=Role.SYSTEM, content=self.system_prompt))
+        messages.append(Message(role=Role.USER, content=user_input))
+
+        tool_schemas = self.tools.to_schemas() or None
+
+        for _ in range(self.max_iterations):
+            assistant_msg: Message | None = None
+
+            # 1. 流式调 LLM：透传 token，累积出完整 assistant_msg
+            for event in self.llm.chat_stream(messages, tools=tool_schemas):
+                if event.type == "token":
+                    yield event
+                elif event.type == "tool_call":
+                    yield event
+                elif event.type == "done":
+                    assistant_msg = event.final
+
+            # done 事件保证 assistant_msg 非空
+            assert assistant_msg is not None
+            messages.append(assistant_msg)
+
+            # 2. 无 tool_calls => 最终答案，产出 done 结束
+            if not assistant_msg.tool_calls:
+                yield StreamEvent(type="done", final=assistant_msg)
+                return
+
+            # 3. 执行所有工具调用，回填并产出 tool_result 事件
+            for call in assistant_msg.tool_calls:
+                result = self.tools.execute(call.name, call.arguments)
+                messages.append(
+                    Message(
+                        role=Role.TOOL,
+                        content=result,
+                        tool_call_id=call.id,
+                        name=call.name,
+                    )
+                )
+                yield StreamEvent(
+                    type="tool_result",
+                    content=result,
+                    call_id=call.id,
+                )
+
+        # 达到最大迭代仍未结束
+        yield StreamEvent(
+            type="done",
+            final=Message(role=Role.ASSISTANT, content=_MAX_ITERATIONS_MESSAGE),
+        )

@@ -4,7 +4,8 @@ A general-purpose agent core library — the foundational layer for building AI 
 
 ## Status
 
-🚧 P0 — minimal agent loop with tool calling (implemented).
+✅ P0 — minimal agent loop with tool calling.
+✅ P1 — streaming, async (dual-track), pydantic schema, retry.
 
 ## Overview
 
@@ -13,8 +14,12 @@ building AI agents:
 
 - **Unified LLM access** — one `LLMClient` abstraction over any OpenAI-compatible
   platform (OpenAI / DeepSeek / Kimi / Qwen / GLM / Ollama / vLLM ...).
-- **Tool system** — turn plain Python functions into LLM-callable tools.
-- **Agent loop** — a ReAct-style loop (reason → act → observe) in ~20 lines.
+- **Tool system** — turn plain Python functions into LLM-callable tools, with
+  automatic JSON schema generation (basic types + pydantic models).
+- **Agent loop** — a ReAct-style loop (reason → act → observe).
+- **Streaming** — `run_stream()` yields tokens as they arrive.
+- **Async (dual-track)** — `AsyncAgent` runs tools in parallel via `asyncio.gather`.
+- **Retry** — `RetryLLM` wraps any client with exponential backoff.
 
 **Switch platforms by changing 3 params**: `base_url` + `api_key` + `model`.
 
@@ -60,6 +65,56 @@ set DEEPSEEK_API_KEY=sk-xxx     # or OPENAI_API_KEY
 python examples/quickstart.py
 ```
 
+### Streaming
+
+```python
+from agent_core import Agent, StreamingLLM
+
+llm = StreamingLLM(base_url=..., api_key=..., model=...)
+agent = Agent(llm=llm, tools=tools)
+for event in agent.run_stream("写一首诗"):
+    if event.type == "token":
+        print(event.delta, end="", flush=True)
+```
+
+### Async (parallel tool execution)
+
+```python
+import asyncio
+from agent_core import AsyncAgent, AsyncOpenAICompatibleClient, AsyncToolRegistry
+
+async def main():
+    llm = AsyncOpenAICompatibleClient(base_url=..., api_key=..., model=...)
+    agent = AsyncAgent(llm=llm, tools=async_tools)
+    # multiple tool_calls in one turn run in parallel via asyncio.gather
+    print(await agent.run("..."))
+
+asyncio.run(main())
+```
+
+### Pydantic tool params
+
+```python
+from pydantic import BaseModel
+from agent_core import tool
+
+class SearchParams(BaseModel):
+    query: str
+    top_k: int = 5
+
+@tool
+def search(params: SearchParams) -> list[dict]:
+    """语义搜索。"""
+    ...
+```
+
+### Retry
+
+```python
+from agent_core import OpenAICompatibleClient, RetryLLM
+llm = RetryLLM(OpenAICompatibleClient(...), max_retries=3)  # auto-retry on failure
+```
+
 ## Architecture
 
 ```
@@ -90,7 +145,7 @@ LLM chat → parse tool_calls → execute tools → append tool results → repe
 ## Tests
 
 ```bash
-pytest tests/        # 60 tests, no API key / network needed (mock LLM)
+pytest tests/        # 94 tests, no API key / network needed (mock LLM)
 ```
 
 ## Tech Stack

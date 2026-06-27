@@ -5,7 +5,8 @@
 核心组件：
 - ``Tool``：一个工具 = Python 函数 + 元数据 + 参数 JSON Schema。
 - ``ToolRegistry``：工具注册表，按名查找、批量转 schema、执行调度。
-- ``@tool`` 装饰器：从函数签名 + docstring 自动生成 Tool（P0 简化版）。
+- ``@tool`` 装饰器：从函数签名 + docstring 自动生成 Tool。
+  支持基础类型 (str/int/float/bool) 与 pydantic BaseModel（自动生成完整 schema）。
 
 设计原则：
 - 工具执行错误返回错误字符串而非抛异常（ReAct：失败也是观察，让 LLM 有机会重试）。
@@ -17,13 +18,21 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Any, Callable, get_type_hints, overload
+from typing import TYPE_CHECKING, Any, Callable, get_type_hints, overload
 
 from .messages import ToolCall
+
+if TYPE_CHECKING:
+    from pydantic import BaseModel
 
 
 class Tool:
     """一个工具 = Python 函数 + 元数据 + 参数 JSON Schema。
+
+    支持两类参数来源：
+    - 基础类型 (str/int/float/bool)：手写 parameters dict。
+    - pydantic BaseModel：通过 pydantic_models 指定参数名->模型类，
+      schema 自动从模型生成，run 时自动构造校验。
 
     Example:
         >>> def add(a: int, b: int) -> int:
@@ -46,15 +55,29 @@ class Tool:
         name: str,
         description: str,
         parameters: dict,
+        pydantic_models: dict[str, type] | None = None,
     ):
         self.func = func
         self.name = name
         self.description = description
         self.parameters = parameters
+        # 参数名 -> BaseModel 子类，用于 run 时构造校验
+        self.pydantic_models: dict[str, type] = pydantic_models or {}
 
     def run(self, **kwargs: Any) -> str:
-        """执行工具函数，返回值 stringify 为字符串。"""
-        result = self.func(**kwargs)
+        """执行工具函数，返回值 stringify 为字符串。
+
+        对 pydantic_models 中登记的参数，先做 Model(**value) 校验再传入。
+        校验失败抛 ValidationError，由 ToolRegistry.execute 捕获转错误字符串。
+        """
+        call_kwargs = dict(kwargs)
+        for pname, model_cls in self.pydantic_models.items():
+            if pname in call_kwargs:
+                raw = call_kwargs[pname]
+                # 已是模型实例则跳过；dict 则构造校验
+                if not isinstance(raw, model_cls):
+                    call_kwargs[pname] = model_cls(**raw)
+        result = self.func(**call_kwargs)
         return self._stringify(result)
 
     def to_schema(self) -> dict:
@@ -145,7 +168,16 @@ _TYPE_NAME_MAP: dict[str, str] = {
 }
 
 
-def _signature_to_parameters(func: Callable[..., Any]) -> dict:
+def _is_basemodel(annotation: Any) -> bool:
+    """判断标注是否是 pydantic BaseModel 子类。"""
+    try:
+        from pydantic import BaseModel
+    except ImportError:
+        return False
+    return isinstance(annotation, type) and issubclass(annotation, BaseModel)
+
+
+def _signature_to_parameters(func: Callable[..., Any]) -> tuple[dict, dict[str, type]]:
     """从函数签名 + docstring 推导参数 JSON Schema。
 
     规则：
@@ -153,9 +185,13 @@ def _signature_to_parameters(func: Callable[..., Any]) -> dict:
     - description = docstring 第一行（去空）
     - 每个参数：type 来自类型标注映射，未标注默认 string
     - required = 所有无默认值的参数
+    - pydantic BaseModel 参数：用 model_json_schema() 生成完整 schema
 
     用 typing.get_type_hints 解析标注，正确处理 ``from __future__ import annotations``
     下的字符串化标注（此时 param.annotation 是 "int" 这样的字符串而非类型对象）。
+
+    Returns:
+        (parameters_schema, pydantic_models) —— 后者是 {参数名: BaseModel 子类}。
     """
     sig = inspect.signature(func)
 
@@ -167,6 +203,7 @@ def _signature_to_parameters(func: Callable[..., Any]) -> dict:
 
     properties: dict[str, Any] = {}
     required: list[str] = []
+    pydantic_models: dict[str, type] = {}
 
     for pname, param in sig.parameters.items():
         # 跳过 *args / **kwargs（P0 不支持可变参数工具）
@@ -178,24 +215,31 @@ def _signature_to_parameters(func: Callable[..., Any]) -> dict:
         if annotation is None:
             annotation = param.annotation if param.annotation is not inspect.Parameter.empty else str
 
-        # 类型映射：支持类型对象（int）和字符串名（"int"）两种形式
-        json_type = _TYPE_MAP.get(annotation)
-        if json_type is None and isinstance(annotation, str):
-            json_type = _TYPE_NAME_MAP.get(annotation, "string")
-        if json_type is None:
-            json_type = "string"
-
-        properties[pname] = {"type": json_type}
+        # pydantic BaseModel 分支：生成完整 schema
+        if _is_basemodel(annotation):
+            schema = annotation.model_json_schema()
+            # model_json_schema 顶层带 title（模型名），作为该参数的 schema
+            properties[pname] = schema
+            pydantic_models[pname] = annotation
+        else:
+            # 基础类型映射：支持类型对象（int）和字符串名（"int"）两种形式
+            json_type = _TYPE_MAP.get(annotation)
+            if json_type is None and isinstance(annotation, str):
+                json_type = _TYPE_NAME_MAP.get(annotation, "string")
+            if json_type is None:
+                json_type = "string"
+            properties[pname] = {"type": json_type}
 
         # 无默认值 => 必填
         if param.default is inspect.Parameter.empty:
             required.append(pname)
 
-    return {
+    schema = {
         "type": "object",
         "properties": properties,
         "required": required,
     }
+    return schema, pydantic_models
 
 
 def _docstring_description(func: Callable[..., Any]) -> str:
@@ -230,11 +274,13 @@ def tool(
     """
 
     def _wrap(fn: Callable[..., Any]) -> Tool:
+        parameters, pydantic_models = _signature_to_parameters(fn)
         return Tool(
             func=fn,
             name=name or fn.__name__,
             description=description or _docstring_description(fn),
-            parameters=_signature_to_parameters(fn),
+            parameters=parameters,
+            pydantic_models=pydantic_models or None,
         )
 
     if func is not None:

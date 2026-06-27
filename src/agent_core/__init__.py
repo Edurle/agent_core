@@ -24,8 +24,17 @@
 """
 
 from .agent import Agent
+from .async_api import (
+    AsyncAgent,
+    AsyncLLMClient,
+    AsyncOpenAICompatibleClient,
+    AsyncRetryLLM,
+    AsyncToolRegistry,
+)
 from .llm import LLMClient, OpenAICompatibleClient
-from .messages import Message, Role, ToolCall, assistant, system, tool_result, user
+from .messages import Message, Role, StreamEvent, ToolCall, assistant, system, tool_result, user
+from .retry import RetryLLM
+from .streaming import StreamingLLM
 from .tools import Tool, ToolRegistry, tool
 
 __all__ = [
@@ -33,6 +42,7 @@ __all__ = [
     "Message",
     "Role",
     "ToolCall",
+    "StreamEvent",
     "system",
     "user",
     "assistant",
@@ -40,12 +50,20 @@ __all__ = [
     # LLM
     "LLMClient",
     "OpenAICompatibleClient",
+    "StreamingLLM",
+    "RetryLLM",
     # 工具
     "Tool",
     "ToolRegistry",
     "tool",
     # Agent
     "Agent",
+    # 异步 API（双轨）
+    "AsyncLLMClient",
+    "AsyncOpenAICompatibleClient",
+    "AsyncRetryLLM",
+    "AsyncToolRegistry",
+    "AsyncAgent",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

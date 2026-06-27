@@ -76,3 +76,26 @@ def tool_result(content: str, tool_call_id: str, name: str) -> Message:
         tool_call_id=tool_call_id,
         name=name,
     )
+
+
+# ── 流式事件 ──────────────────────────────────────────────
+
+
+@dataclass
+class StreamEvent:
+    """流式输出的事件。
+
+    type 取值：
+    - ``"token"``：LLM 生成的一段文本，delta 是该片段。
+    - ``"tool_call"``：本轮 LLM 请求的工具调用（完整解析后），call 是 ToolCall。
+      流式 tool_calls 是增量拼接的，本事件在累积完成后才发出。
+    - ``"tool_result"``：工具执行结果，content 是结果字符串，call_id 关联请求。
+    - ``"done"``：本轮/整个 run 结束，final 是最终的 assistant Message（含完整 content）。
+    """
+
+    type: str
+    delta: str | None = None
+    call: ToolCall | None = None
+    call_id: str | None = None
+    content: str | None = None
+    final: Message | None = None
