@@ -18,7 +18,7 @@ Hook 集成（方案 A，纯观察）：
 from __future__ import annotations
 
 import time
-from typing import AsyncIterator, Iterator
+from typing import TYPE_CHECKING, AsyncIterator, Iterator
 
 from .hook import (
     ChainEndEvent,
@@ -31,6 +31,9 @@ from .hook import (
 from .llm import LLMProtocol
 from .messages import Message, Role, StreamEvent
 from .tools import ToolRegistry
+
+if TYPE_CHECKING:
+    from .memory import Memory
 
 _MAX_ITERATIONS_MESSAGE = "[agent 达到最大迭代次数，未给出最终回复]"
 
@@ -70,6 +73,7 @@ class Agent:
         max_iterations: int = 2000,
         hooks: list[Hook] | None = None,
         default_state: dict | None = None,
+        memory: "Memory | None" = None,
     ):
         self.llm = llm
         self.tools = tools or ToolRegistry()
@@ -77,6 +81,9 @@ class Agent:
         self.max_iterations = max_iterations
         self.hooks = HookRegistry(hooks)
         self.default_state = default_state
+        # 记忆：默认 ListMemory（每次 run 跨 invoke 持有，支持多轮对话）
+        from .memory import ListMemory
+        self.memory: "Memory" = memory if memory is not None else ListMemory()
         # 让工具层 + LLM 层共享 Agent 的 hooks（若它们没自定义 hooks）
         # 保证一个 Agent 实例的 chain/llm/tool 事件都进同一套 hook
         if not self.tools.hooks._hooks:
@@ -162,13 +169,21 @@ class Agent:
         runtime = ToolRuntime(agent_state=agent_state, stream_writer=StreamWriter(_emit))
         return runtime, buffer
 
-    # ── 共享：组装初始消息 ───────────────────────────────────
+    # ── 共享：消息历史（memory）──────────────────────────────
 
-    def _init_messages(self, user_input: str) -> list[Message]:
+    def _add_user_message(self, user_input: str) -> None:
+        """把用户输入写入记忆（run 开始时调用）。"""
+        self.memory.add(Message(role=Role.USER, content=user_input))
+
+    def _build_llm_messages(self) -> list[Message]:
+        """组装发给 LLM 的消息：system_prompt + memory.load()。
+
+        system_prompt 不进 memory（由 Agent 单独管理），每次拼到最前。
+        """
         messages: list[Message] = []
         if self.system_prompt:
             messages.append(Message(role=Role.SYSTEM, content=self.system_prompt))
-        messages.append(Message(role=Role.USER, content=user_input))
+        messages.extend(self.memory.load())
         return messages
 
     @property
@@ -212,7 +227,7 @@ class Agent:
         """
         start = self._start_run(input)
         run_state = self._resolve_state(state)
-        messages = self._init_messages(input)
+        self._add_user_message(input)   # 用户输入入记忆
         tool_schemas = self._tool_schemas
         last_content = ""
         iterations = 0
@@ -222,8 +237,9 @@ class Agent:
             for i in range(self.max_iterations):
                 iteration_ctx.set(i)
                 iterations = i + 1
+                messages = self._build_llm_messages()   # 每轮从记忆加载
                 assistant_msg = self.llm.invoke(messages, tools=tool_schemas)
-                messages.append(assistant_msg)
+                self.memory.add(assistant_msg)
                 if not assistant_msg.tool_calls:
                     answer = assistant_msg.content or ""
                     break
@@ -233,7 +249,7 @@ class Agent:
                 for call in assistant_msg.tool_calls:
                     runtime = self._make_runtime(call.name, run_state)
                     result = self.tools.execute(call.name, call.arguments, runtime=runtime)
-                    messages.append(_tool_msg(result, call))
+                    self.memory.add(_tool_msg(result, call))
             else:
                 answer = last_content or _MAX_ITERATIONS_MESSAGE
 
@@ -264,7 +280,7 @@ class Agent:
         """
         start = await self._astart_run(input)
         run_state = self._resolve_state(state)
-        messages = self._init_messages(input)
+        self._add_user_message(input)
         tool_schemas = self._tool_schemas
         last_content = ""
         iterations = 0
@@ -274,8 +290,9 @@ class Agent:
             for i in range(self.max_iterations):
                 iteration_ctx.set(i)
                 iterations = i + 1
+                messages = self._build_llm_messages()
                 assistant_msg = await self.llm.ainvoke(messages, tools=tool_schemas)
-                messages.append(assistant_msg)
+                self.memory.add(assistant_msg)
                 if not assistant_msg.tool_calls:
                     answer = assistant_msg.content or ""
                     break
@@ -322,7 +339,7 @@ class Agent:
         """
         start = self._start_run(input)
         run_state = self._resolve_state(state)
-        messages = self._init_messages(input)
+        self._add_user_message(input)
         tool_schemas = self._tool_schemas
         error: Exception | None = None
 
@@ -330,10 +347,11 @@ class Agent:
             for i in range(self.max_iterations):
                 iteration_ctx.set(i)
                 # 流式调 LLM：透传 token，累积出 final
+                messages = self._build_llm_messages()
                 assistant_msg = yield from _collect_stream_final(
                     self.llm.stream(messages, tools=tool_schemas)
                 )
-                messages.append(assistant_msg)
+                self.memory.add(assistant_msg)
 
                 if not assistant_msg.tool_calls:
                     final_event = StreamEvent(type="done", final=assistant_msg)
@@ -349,7 +367,7 @@ class Agent:
                 for call in assistant_msg.tool_calls:
                     runtime, writer_buf = self._make_runtime_with_buffer(call.name, run_state)
                     result = self.tools.execute(call.name, call.arguments, runtime=runtime)
-                    messages.append(_tool_msg(result, call))
+                    self.memory.add(_tool_msg(result, call))
                     # 先产出 stream_writer 的输出（工具执行期间缓冲的）
                     for text in writer_buf:
                         yield StreamEvent(type="tool_writer", content=text, call_id=call.id)
@@ -382,12 +400,13 @@ class Agent:
         """
         start = await self._astart_run(input)
         run_state = self._resolve_state(state)
-        messages = self._init_messages(input)
+        self._add_user_message(input)
         tool_schemas = self._tool_schemas
 
         try:
             for i in range(self.max_iterations):
                 iteration_ctx.set(i)
+                messages = self._build_llm_messages()
                 assistant_msg: Message | None = None
                 async for event in self.llm.astream(messages, tools=tool_schemas):
                     if event.type == "done":
@@ -395,7 +414,7 @@ class Agent:
                     else:
                         yield event
                 assert assistant_msg is not None
-                messages.append(assistant_msg)
+                self.memory.add(assistant_msg)
 
                 if not assistant_msg.tool_calls:
                     await self.hooks.aemit(ChainEndEvent(
@@ -414,7 +433,7 @@ class Agent:
                     return res, buf
                 pairs = await _aio2.gather(*[_run_one_stream(c) for c in assistant_msg.tool_calls])
                 for call, (result, writer_buf) in zip(assistant_msg.tool_calls, pairs):
-                    messages.append(_tool_msg(result, call))
+                    self.memory.add(_tool_msg(result, call))
                     for text in writer_buf:
                         yield StreamEvent(type="tool_writer", content=text, call_id=call.id)
                     yield StreamEvent(type="tool_result", content=result, call_id=call.id)

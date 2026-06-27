@@ -50,6 +50,7 @@ from .hook import (
     ToolWriterEvent,
 )
 from .llm import LLM, LLMProtocol
+from .memory import ListMemory, Memory
 from .messages import Message, Role, StreamEvent, ToolCall, assistant, system, tool_result, user
 from .runtime import StreamWriter, ToolRuntime
 from .state import AgentState
@@ -84,10 +85,12 @@ __all__ = [
     "tool",
     # Agent（统一：invoke/ainvoke/stream/astream）
     "Agent",
-    # 共享状态 + 工具运行时
+    # 共享状态 + 工具运行时 + 记忆
     "AgentState",
     "ToolRuntime",
     "StreamWriter",
+    "Memory",
+    "ListMemory",
     # Hook（方案 A，事件回调）
     "Hook",
     "HookEvent",
