@@ -81,4 +81,5 @@ run_p2.log       # 统一接口验证运行日志
 run_mcp.log      # MCP 验证运行日志
 run_tavily.log   # MCP HTTP (Tavily) 验证日志
 run_trace.log    # Hook+Trace 验证日志
+run_state.log    # Agent State 验证日志
 *.log

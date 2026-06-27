@@ -50,6 +50,7 @@ from .hook import (
 )
 from .llm import LLM, LLMProtocol
 from .messages import Message, Role, StreamEvent, ToolCall, assistant, system, tool_result, user
+from .state import AgentState
 from .tools import Tool, ToolRegistry, tool
 from .trace import Span, Trace, TraceCollector
 
@@ -81,6 +82,8 @@ __all__ = [
     "tool",
     # Agent（统一：invoke/ainvoke/stream/astream）
     "Agent",
+    # 共享状态
+    "AgentState",
     # Hook（方案 A，事件回调）
     "Hook",
     "HookEvent",

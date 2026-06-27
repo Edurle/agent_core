@@ -44,13 +44,22 @@ class Agent:
         system_prompt: 系统提示词，空字符串则不加 system 消息。
         max_iterations: 最大循环轮数，防止死循环。默认 2000。
         hooks: hook 回调列表（方案 A，纯观察）。如 TraceCollector。
+        default_state: 默认共享状态（dict）。每次调用未传 state 时用其副本。
+            工具通过签名声明 ``state: AgentState`` 参数访问/修改它。
 
-    四种调用方式::
+    四种调用方式（均支持 state 参数）::
 
-        answer = agent.invoke("你好")                 # 同步非流式
-        answer = await agent.ainvoke("你好")           # 异步非流式（工具并行）
-        for ev in agent.stream("写一首诗"): ...        # 同步流式
-        async for ev in agent.astream("写一首诗"): ...  # 异步流式
+        answer = agent.invoke("你好")                          # 同步非流式
+        answer = await agent.ainvoke("你好")                    # 异步非流式（工具并行）
+        for ev in agent.stream("写一首诗"): ...                 # 同步流式
+        async for ev in agent.astream("写一首诗"): ...          # 异步流式
+
+    state 用法::
+
+        agent = Agent(llm=llm, tools=tools, default_state={"total": 0})
+        state = {"total": 0}
+        agent.invoke("累积 3 和 5", state=state)
+        print(state["total"])   # 工具修改反映在传入的 dict 上
     """
 
     def __init__(
@@ -60,12 +69,14 @@ class Agent:
         system_prompt: str = "",
         max_iterations: int = 2000,
         hooks: list[Hook] | None = None,
+        default_state: dict | None = None,
     ):
         self.llm = llm
         self.tools = tools or ToolRegistry()
         self.system_prompt = system_prompt
         self.max_iterations = max_iterations
         self.hooks = HookRegistry(hooks)
+        self.default_state = default_state
         # 让工具层 + LLM 层共享 Agent 的 hooks（若它们没自定义 hooks）
         # 保证一个 Agent 实例的 chain/llm/tool 事件都进同一套 hook
         if not self.tools.hooks._hooks:
@@ -73,6 +84,24 @@ class Agent:
         llm_hooks = getattr(self.llm, "hooks", None)
         if llm_hooks is not None and not llm_hooks._hooks:
             self.llm.hooks = self.hooks  # type: ignore[attr-defined]
+
+    def _resolve_state(self, state: dict | None) -> dict:
+        """解析本次 run 的 state。
+
+        - state 显式传入：**直接用该 dict 对象**（保持引用，工具的修改反映在用户的 dict 上）。
+        - state 为 None：用 default_state 的深拷贝副本（避免污染默认值）。
+        - 都没有：返回空 AgentState。
+
+        返回的是 dict（鸭子类型），工具签名标注 state: AgentState 只是类型提示。
+        """
+        from .state import AgentState
+        if state is not None:
+            # 直接用用户传入的对象，保持引用（工具修改可见）
+            return state
+        if self.default_state is not None:
+            import copy
+            return copy.deepcopy(self.default_state)
+        return AgentState()
 
     # ── 共享：组装初始消息 ───────────────────────────────────
 
@@ -114,9 +143,16 @@ class Agent:
     #  invoke：同步非流式
     # ═══════════════════════════════════════════════════════════
 
-    def invoke(self, input: str) -> str:
-        """同步非流式运行。完整跑完返回最终文本。"""
+    def invoke(self, input: str, state: dict | None = None) -> str:
+        """同步非流式运行。完整跑完返回最终文本。
+
+        Args:
+            input: 用户输入。
+            state: 本次调用的共享状态。None 则用 default_state 的副本。
+                工具通过签名声明 state 参数访问/修改它（修改反映在传入的 dict 上）。
+        """
         start = self._start_run(input)
+        run_state = self._resolve_state(state)
         messages = self._init_messages(input)
         tool_schemas = self._tool_schemas
         last_content = ""
@@ -136,7 +172,7 @@ class Agent:
                 answer = last_content
                 # 同步逐个执行工具
                 for call in assistant_msg.tool_calls:
-                    result = self.tools.execute(call.name, call.arguments)
+                    result = self.tools.execute(call.name, call.arguments, state=run_state)
                     messages.append(_tool_msg(result, call))
             else:
                 answer = last_content or _MAX_ITERATIONS_MESSAGE
@@ -159,9 +195,15 @@ class Agent:
     #  ainvoke：异步非流式（工具并行）
     # ═══════════════════════════════════════════════════════════
 
-    async def ainvoke(self, input: str) -> str:
-        """异步非流式运行。同一轮多个 tool_calls 用 asyncio.gather 并行执行。"""
+    async def ainvoke(self, input: str, state: dict | None = None) -> str:
+        """异步非流式运行。同一轮多个 tool_calls 用 asyncio.gather 并行执行。
+
+        Args:
+            input: 用户输入。
+            state: 本次调用的共享状态。None 则用 default_state 的副本。
+        """
         start = await self._astart_run(input)
+        run_state = self._resolve_state(state)
         messages = self._init_messages(input)
         tool_schemas = self._tool_schemas
         last_content = ""
@@ -179,8 +221,8 @@ class Agent:
                     break
                 last_content = assistant_msg.content or last_content
                 answer = last_content
-                # 并行执行本轮所有工具调用
-                results = await self.tools.aexecute_many(assistant_msg.tool_calls)
+                # 并行执行本轮所有工具调用（共享同一 run_state）
+                results = await self.tools.aexecute_many(assistant_msg.tool_calls, state=run_state)
                 for call, result in zip(assistant_msg.tool_calls, results):
                     messages.append(_tool_msg(result, call))
             else:
@@ -204,13 +246,18 @@ class Agent:
     #  stream：同步流式
     # ═══════════════════════════════════════════════════════════
 
-    def stream(self, input: str) -> Iterator[StreamEvent]:
+    def stream(self, input: str, state: dict | None = None) -> Iterator[StreamEvent]:
         """同步流式运行。逐 token 产出事件。
 
         每轮 LLM 调用逐 token 产出 ``token`` 事件；工具结果作为 ``tool_result`` 事件；
         仅在最终给出答案时产出 ``done`` 事件。
+
+        Args:
+            input: 用户输入。
+            state: 本次调用的共享状态。None 则用 default_state 的副本。
         """
         start = self._start_run(input)
+        run_state = self._resolve_state(state)
         messages = self._init_messages(input)
         tool_schemas = self._tool_schemas
         error: Exception | None = None
@@ -236,7 +283,7 @@ class Agent:
 
                 # 同步逐个执行工具，产出 tool_result 事件
                 for call in assistant_msg.tool_calls:
-                    result = self.tools.execute(call.name, call.arguments)
+                    result = self.tools.execute(call.name, call.arguments, state=run_state)
                     messages.append(_tool_msg(result, call))
                     yield StreamEvent(type="tool_result", content=result, call_id=call.id)
         except Exception as e:
@@ -256,12 +303,17 @@ class Agent:
     #  astream：异步流式（工具并行）
     # ═══════════════════════════════════════════════════════════
 
-    async def astream(self, input: str) -> AsyncIterator[StreamEvent]:
+    async def astream(self, input: str, state: dict | None = None) -> AsyncIterator[StreamEvent]:
         """异步流式运行。逐 token 产出事件，工具并行执行。
 
         用 ``async for event in agent.astream(...)`` 消费。
+
+        Args:
+            input: 用户输入。
+            state: 本次调用的共享状态。None 则用 default_state 的副本。
         """
         start = await self._astart_run(input)
+        run_state = self._resolve_state(state)
         messages = self._init_messages(input)
         tool_schemas = self._tool_schemas
 
@@ -287,7 +339,7 @@ class Agent:
                     return
 
                 # 并行执行工具，然后逐个产出 tool_result 事件
-                results = await self.tools.aexecute_many(assistant_msg.tool_calls)
+                results = await self.tools.aexecute_many(assistant_msg.tool_calls, state=run_state)
                 for call, result in zip(assistant_msg.tool_calls, results):
                     messages.append(_tool_msg(result, call))
                     yield StreamEvent(type="tool_result", content=result, call_id=call.id)

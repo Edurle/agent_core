@@ -26,6 +26,7 @@ from .messages import ToolCall
 if TYPE_CHECKING:
     from pydantic import BaseModel
     from .mcp import MCPClient, MCPTool
+    from .state import AgentState
 
 
 class Tool:
@@ -58,6 +59,7 @@ class Tool:
         description: str,
         parameters: dict,
         pydantic_models: dict[str, type] | None = None,
+        needs_state: bool = False,
     ):
         self.func = func
         self.name = name
@@ -65,20 +67,27 @@ class Tool:
         self.parameters = parameters
         # 参数名 -> BaseModel 子类，用于 run 时构造校验
         self.pydantic_models: dict[str, type] = pydantic_models or {}
+        # 是否声明了 state 参数（框架执行时按需注入）
+        self.needs_state = needs_state
 
-    def run(self, **kwargs: Any) -> str:
+    def run(self, _inject_state: Any = None, **kwargs: Any) -> str:
         """执行工具函数（同步），返回值 stringify 为字符串。
 
         对 pydantic_models 中登记的参数，先做 Model(**value) 校验再传入。
         校验失败抛 ValidationError，由 ToolRegistry.execute 捕获转错误字符串。
 
         异步工具（MCPTool）不支持 run，会抛 NotImplementedError。
+
+        Args:
+            _inject_state: 由 ToolRegistry.execute 注入的 AgentState（仅 needs_state 工具会收到）。
         """
         call_kwargs = self._resolve_pydantic_params(kwargs)
+        if self.needs_state:
+            call_kwargs["state"] = _inject_state
         result = self.func(**call_kwargs)
         return self._stringify(result)
 
-    async def acall(self, **kwargs: Any) -> str:
+    async def acall(self, _inject_state: Any = None, **kwargs: Any) -> str:
         """执行工具函数（异步），返回值 stringify 为字符串。
 
         对协程函数工具：构造 pydantic 参数后 await。
@@ -86,13 +95,18 @@ class Tool:
 
         对同步 func 工具：通常不应走 acall（aexecute 会丢线程池调 run）。
         若直接调本方法且 func 是同步的，则在线程池执行。
+
+        Args:
+            _inject_state: 由 ToolRegistry.aexecute 注入的 AgentState（仅 needs_state 工具会收到）。
         """
         if self.is_async():
             call_kwargs = self._resolve_pydantic_params(kwargs)
+            if self.needs_state:
+                call_kwargs["state"] = _inject_state
             result = await self.func(**call_kwargs)
             return self._stringify(result)
         # 同步 func：丢线程池避免阻塞
-        return await asyncio.to_thread(self.run, **kwargs)
+        return await asyncio.to_thread(self.run, _inject_state=_inject_state, **kwargs)
 
     def _resolve_pydantic_params(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """把 dict 形式的 pydantic 参数构造为模型实例（校验）。
@@ -170,12 +184,17 @@ class ToolRegistry:
         """所有工具的 schema 列表，传给 LLM 的 tools 参数。"""
         return [t.to_schema() for t in self._tools.values()]
 
-    def execute(self, name: str, arguments: dict) -> str:
+    def execute(self, name: str, arguments: dict, state: "AgentState | None" = None) -> str:
         """按名查找并同步执行工具。
 
         工具执行出错时返回错误字符串而非抛异常，
         让 LLM 看到错误后有机会修正参数或换工具重试。
         触发 on_tool_start → on_tool_end/on_tool_error 事件。
+
+        Args:
+            name: 工具名。
+            arguments: LLM 传来的参数（不含 state）。
+            state: 本次调用的 AgentState。若工具声明了 state 参数则注入，否则忽略。
         """
         from .hook import ToolEndEvent, ToolErrorEvent, ToolStartEvent
         import time as _time
@@ -184,7 +203,7 @@ class ToolRegistry:
         self.hooks.emit(ToolStartEvent(type="on_tool_start", name=name, arguments=arguments))
         t0 = _time.time()
         try:
-            result = tool.run(**arguments)
+            result = tool.run(_inject_state=state, **arguments) if tool.needs_state else tool.run(**arguments)
             self.hooks.emit(ToolEndEvent(
                 type="on_tool_end", name=name, result=result, duration=_time.time() - t0
             ))
@@ -196,11 +215,11 @@ class ToolRegistry:
             ))
             return err
 
-    def execute_call(self, call: ToolCall) -> str:
+    def execute_call(self, call: ToolCall, state: "AgentState | None" = None) -> str:
         """执行一个 ToolCall（agent 循环的便捷入口）。"""
-        return self.execute(call.name, call.arguments)
+        return self.execute(call.name, call.arguments, state=state)
 
-    async def aexecute(self, name: str, arguments: dict) -> str:
+    async def aexecute(self, name: str, arguments: dict, state: "AgentState | None" = None) -> str:
         """按名查找并异步执行工具。
 
         统一走 ``tool.acall``：
@@ -209,6 +228,11 @@ class ToolRegistry:
 
         工具异常被捕获返回错误字符串（ReAct 语义，与 execute 一致）。
         触发 on_tool_start → on_tool_end/on_tool_error 事件。
+
+        Args:
+            name: 工具名。
+            arguments: LLM 传来的参数（不含 state）。
+            state: 本次调用的 AgentState。若工具声明了 state 参数则注入，否则忽略。
         """
         from .hook import ToolEndEvent, ToolErrorEvent, ToolStartEvent
         import time as _time
@@ -217,7 +241,10 @@ class ToolRegistry:
         await self.hooks.aemit(ToolStartEvent(type="on_tool_start", name=name, arguments=arguments))
         t0 = _time.time()
         try:
-            result = await tool.acall(**arguments)
+            if tool.needs_state:
+                result = await tool.acall(_inject_state=state, **arguments)
+            else:
+                result = await tool.acall(**arguments)
             await self.hooks.aemit(ToolEndEvent(
                 type="on_tool_end", name=name, result=result, duration=_time.time() - t0
             ))
@@ -229,9 +256,13 @@ class ToolRegistry:
             ))
             return err
 
-    async def aexecute_many(self, calls: list[ToolCall]) -> list[str]:
-        """并行执行多个工具调用（asyncio.gather），返回与 calls 顺序对应的结果列表。"""
-        tasks = [self.aexecute(c.name, c.arguments) for c in calls]
+    async def aexecute_many(self, calls: list[ToolCall], state: "AgentState | None" = None) -> list[str]:
+        """并行执行多个工具调用（asyncio.gather），返回与 calls 顺序对应的结果列表。
+
+        同一 state 传给本轮所有工具（并行执行共享同一 state 实例）。
+        注意：并行工具若同时写同一 key 有竞争，需自行避免。
+        """
+        tasks = [self.aexecute(c.name, c.arguments, state=state) for c in calls]
         return await asyncio.gather(*tasks)
 
     async def aregister_mcp(self, client: "MCPClient") -> list["MCPTool"]:
@@ -293,7 +324,30 @@ def _is_basemodel(annotation: Any) -> bool:
     return isinstance(annotation, type) and issubclass(annotation, BaseModel)
 
 
-def _signature_to_parameters(func: Callable[..., Any]) -> tuple[dict, dict[str, type]]:
+def _is_state_annotation(annotation: Any) -> bool:
+    """判断标注是否是 state 类型（AgentState 或 dict）。
+
+    用于识别工具签名里的 state 参数（框架注入，不进 LLM schema）。
+    容错：标注可能是类型对象（AgentState/dict）或字符串名（"AgentState"/"dict"）。
+    """
+    if annotation is dict:
+        return True
+    # AgentState 是 dict 子类
+    try:
+        from .state import AgentState
+        if annotation is AgentState:
+            return True
+        if isinstance(annotation, type) and issubclass(annotation, AgentState):
+            return True
+    except ImportError:
+        pass
+    # 字符串形式（PEP 563）
+    if isinstance(annotation, str):
+        return annotation in ("AgentState", "dict")
+    return False
+
+
+def _signature_to_parameters(func: Callable[..., Any]) -> tuple[dict, dict[str, type], bool]:
     """从函数签名 + docstring 推导参数 JSON Schema。
 
     规则：
@@ -302,12 +356,16 @@ def _signature_to_parameters(func: Callable[..., Any]) -> tuple[dict, dict[str, 
     - 每个参数：type 来自类型标注映射，未标注默认 string
     - required = 所有无默认值的参数
     - pydantic BaseModel 参数：用 model_json_schema() 生成完整 schema
+    - **state 参数**（名为 state，标注为 AgentState/dict）：不进 LLM schema，
+      但标记 needs_state=True，由框架在执行时注入。
 
     用 typing.get_type_hints 解析标注，正确处理 ``from __future__ import annotations``
     下的字符串化标注（此时 param.annotation 是 "int" 这样的字符串而非类型对象）。
 
     Returns:
-        (parameters_schema, pydantic_models) —— 后者是 {参数名: BaseModel 子类}。
+        (parameters_schema, pydantic_models, needs_state)
+        —— pydantic_models 是 {参数名: BaseModel 子类}；
+        needs_state 表示函数是否声明了 state 参数（需框架注入）。
     """
     sig = inspect.signature(func)
 
@@ -320,6 +378,7 @@ def _signature_to_parameters(func: Callable[..., Any]) -> tuple[dict, dict[str, 
     properties: dict[str, Any] = {}
     required: list[str] = []
     pydantic_models: dict[str, type] = {}
+    needs_state = False
 
     for pname, param in sig.parameters.items():
         # 跳过 *args / **kwargs（P0 不支持可变参数工具）
@@ -330,6 +389,11 @@ def _signature_to_parameters(func: Callable[..., Any]) -> tuple[dict, dict[str, 
         annotation = hints.get(pname)
         if annotation is None:
             annotation = param.annotation if param.annotation is not inspect.Parameter.empty else str
+
+        # state 参数：不进 LLM schema，标记需注入
+        if pname == "state" and _is_state_annotation(annotation):
+            needs_state = True
+            continue
 
         # pydantic BaseModel 分支：生成完整 schema
         if _is_basemodel(annotation):
@@ -355,7 +419,7 @@ def _signature_to_parameters(func: Callable[..., Any]) -> tuple[dict, dict[str, 
         "properties": properties,
         "required": required,
     }
-    return schema, pydantic_models
+    return schema, pydantic_models, needs_state
 
 
 def _docstring_description(func: Callable[..., Any]) -> str:
@@ -390,13 +454,14 @@ def tool(
     """
 
     def _wrap(fn: Callable[..., Any]) -> Tool:
-        parameters, pydantic_models = _signature_to_parameters(fn)
+        parameters, pydantic_models, needs_state = _signature_to_parameters(fn)
         return Tool(
             func=fn,
             name=name or fn.__name__,
             description=description or _docstring_description(fn),
             parameters=parameters,
             pydantic_models=pydantic_models or None,
+            needs_state=needs_state,
         )
 
     if func is not None:
