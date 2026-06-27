@@ -4,10 +4,14 @@
 之间的适配：把 MCP server 暴露的工具包装成 agent_core 的 ``Tool``，注册进
 ``ToolRegistry``，Agent 调用时无感（当本地工具用）。
 
+支持两种 transport：
+- **stdio**（``MCPClient.from_command``）：本地子进程 server（如官方 filesystem）。
+- **Streamable HTTP**（``MCPClient.from_url``）：远程 server（如 Tavily 检索）。
+
 三道"缝"的缝合：
 1. 工具表示：SDK 的 Tool（inputSchema）→ agent_core Tool（parameters），零转换。
 2. 返回格式：SDK CallToolResult（content 数组 + isError）→ 字符串（展平 content）。
-3. 生命周期：SDK 的 stdio_client + ClientSession context → MCPClient 统一管理。
+3. 生命周期：SDK 的 transport + ClientSession context → MCPClient 统一管理。
 
 MCP SDK 是全异步的，因此 MCP 工具**只支持异步调用路径**（Agent.ainvoke/astream）。
 同步 Agent.invoke 调 MCP 工具会抛 NotImplementedError 并给出清晰提示。
@@ -86,7 +90,7 @@ class MCPClient:
         args: list[str] | None = None,
         env: dict[str, str] | None = None,
     ) -> "_MCPConnection":
-        """从子进程命令创建 stdio 连接。
+        """从子进程命令创建 stdio 连接（本地 server）。
 
         返回一个 ``_MCPConnection``，**必须**用 ``async with`` 进入
         （stdio transport 需要在持续存活的 async 作用域内）::
@@ -104,7 +108,38 @@ class MCPClient:
             full_cmd = [command] + (args or [])
         else:
             full_cmd = list(command) + (args or [])
-        return _MCPConnection(full_cmd, env)
+        return _MCPConnection(_StdioTransport(full_cmd, env))
+
+    @classmethod
+    def from_url(
+        cls,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        timeout: float = 30.0,
+        sse_read_timeout: float = 300.0,
+    ) -> "_MCPConnection":
+        """从远程 URL 创建 Streamable HTTP 连接（远程 server）。
+
+        返回一个 ``_MCPConnection``，**必须**用 ``async with`` 进入
+        （HTTP transport 同样需要在持续存活的 async 作用域内）::
+
+            async with MCPClient.from_url("https://mcp.example.com/mcp") as mcp:
+                tools = await mcp.list_tools()
+                ...
+
+        适用于部署在云上或第三方提供的 MCP server（如 Tavily 检索服务）。
+        若 URL 本身不含鉴权信息（如 apikey query 参数），可用 headers 传认证头。
+
+        Args:
+            url: MCP server 的 Streamable HTTP 端点。
+            headers: 额外请求头（如认证 token）。
+            timeout: 请求超时（秒）。
+            sse_read_timeout: SSE 长连接读取超时（秒）。
+        """
+        return _MCPConnection(
+            _StreamableHTTPTransport(url, headers, timeout, sse_read_timeout)
+        )
 
     # ── 核心方法 ─────────────────────────────────────────────
 
@@ -141,30 +176,37 @@ class MCPClient:
 
 
 # ═══════════════════════════════════════════════════════════
-#  _MCPConnection —— async context 工厂（强制 async with）
+#  Transport 抽象（stdio / Streamable HTTP）
 # ═══════════════════════════════════════════════════════════
 
 
-class _MCPConnection:
-    """MCPClient.from_command 的返回值，async context manager。
+class _Transport:
+    """MCP transport 的抽象基类。
 
-    **必须用 ``async with`` 进入**。stdio transport 的生命周期绑定在 async 作用域，
-    脱离作用域（如裸 ``await`` 后持有）会导致连接被回收关闭。
+    子类实现 ``enter()`` 返回 (transport_cm, read, write)，
+    和 ``exit()`` 关闭。两层 context 的生命周期由 _MCPConnection 统一编排。
 
-    进入时：启动子进程 + 建立 stdio + ClientSession + initialize。
-    退出时：逆序关闭 session 和 stdio。
-
-    不实现 __await__（刻意）：避免误用裸 await 脱离 context。
+    HTTP transport 的 streamablehttp_client 返回三元组 (read, write, get_session_id)，
+    第三个元素（session id 回调）本适配层用不到，子类负责丢弃它只返回 read/write。
     """
+
+    async def enter(self) -> tuple[Any, Any, Any]:
+        raise NotImplementedError
+
+    async def exit(self, exc_type, exc_val, exc_tb) -> None:
+        raise NotImplementedError
+
+
+class _StdioTransport(_Transport):
+    """stdio transport：本地子进程 server。"""
 
     def __init__(self, command: list[str], env: dict[str, str] | None):
         self._command = command
         self._env = env
-        self._stdio_cm: Any = None
-        self._session_cm: Any = None
+        self._cm: Any = None
 
-    async def __aenter__(self) -> MCPClient:
-        from mcp import ClientSession, StdioServerParameters
+    async def enter(self) -> tuple[Any, Any, Any]:
+        from mcp import StdioServerParameters
         from mcp.client.stdio import stdio_client
 
         params = StdioServerParameters(
@@ -172,10 +214,81 @@ class _MCPConnection:
             args=self._command[1:],
             env=self._env,
         )
-        # 两层 async context 嵌套进入
-        self._stdio_cm = stdio_client(params)
-        read, write = await self._stdio_cm.__aenter__()
+        self._cm = stdio_client(params)
+        read, write = await self._cm.__aenter__()
+        return self._cm, read, write
 
+    async def exit(self, exc_type, exc_val, exc_tb) -> None:
+        if self._cm is not None:
+            await self._cm.__aexit__(exc_type, exc_val, exc_tb)
+
+
+class _StreamableHTTPTransport(_Transport):
+    """Streamable HTTP transport：远程 server（如 Tavily）。
+
+    内部用 mcp SDK 的 ``streamablehttp_client``。注意它返回三元组
+    (read, write, get_session_id)，第三个元素本层丢弃。
+    """
+
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str] | None,
+        timeout: float,
+        sse_read_timeout: float,
+    ):
+        self._url = url
+        self._headers = headers
+        self._timeout = timeout
+        self._sse_read_timeout = sse_read_timeout
+        self._cm: Any = None
+
+    async def enter(self) -> tuple[Any, Any, Any]:
+        from mcp.client.streamable_http import streamablehttp_client
+
+        self._cm = streamablehttp_client(
+            self._url,
+            headers=self._headers,
+            timeout=self._timeout,
+            sse_read_timeout=self._sse_read_timeout,
+        )
+        # 三元组：read, write, get_session_id（丢弃第三个）
+        read, write, _get_session_id = await self._cm.__aenter__()
+        return self._cm, read, write
+
+    async def exit(self, exc_type, exc_val, exc_tb) -> None:
+        if self._cm is not None:
+            await self._cm.__aexit__(exc_type, exc_val, exc_tb)
+
+
+# ═══════════════════════════════════════════════════════════
+#  _MCPConnection —— async context 工厂（强制 async with）
+# ═══════════════════════════════════════════════════════════
+
+
+class _MCPConnection:
+    """MCPClient.from_command / from_url 的返回值，async context manager。
+
+    **必须用 ``async with`` 进入**。transport 的生命周期绑定在 async 作用域，
+    脱离作用域（如裸 ``await`` 后持有）会导致连接被回收关闭。
+
+    进入时：建立 transport + ClientSession + initialize。
+    退出时：逆序关闭 session 和 transport。
+
+    不实现 __await__（刻意）：避免误用裸 await 脱离 context。
+    """
+
+    def __init__(self, transport: _Transport):
+        self._transport = transport
+        self._session_cm: Any = None
+
+    async def __aenter__(self) -> MCPClient:
+        from mcp import ClientSession
+
+        # 1. 建立 transport（stdio 或 HTTP），拿到 read/write 流
+        _transport_cm, read, write = await self._transport.enter()
+
+        # 2. 在流上建立会话并初始化
         self._session_cm = ClientSession(read, write)
         session = await self._session_cm.__aenter__()
         await session.initialize()
@@ -183,18 +296,17 @@ class _MCPConnection:
         return MCPClient(session)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        # 逆序退出：先 session 再 stdio
+        # 逆序退出：先 session 再 transport
         errors = []
         if self._session_cm is not None:
             try:
                 await self._session_cm.__aexit__(exc_type, exc_val, exc_tb)
             except Exception as e:  # noqa: BLE001
                 errors.append(e)
-        if self._stdio_cm is not None:
-            try:
-                await self._stdio_cm.__aexit__(exc_type, exc_val, exc_tb)
-            except Exception as e:  # noqa: BLE001
-                errors.append(e)
+        try:
+            await self._transport.exit(exc_type, exc_val, exc_tb)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
         if errors:
             logger.debug("MCP 连接关闭时发生 %d 个异常（已忽略）: %s",
                          len(errors), errors)

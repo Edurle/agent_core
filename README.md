@@ -31,7 +31,7 @@ Capabilities:
 - **Streaming** — `stream` / `astream` yield tokens as they arrive.
 - **Async parallelism** — `ainvoke` / `astream` run tools in parallel via `asyncio.gather`.
 - **Retry** — built into `LLM(max_retries=...)`, exponential backoff.
-- **MCP** — connect any MCP server (filesystem, GitHub, DB, ...), use its tools
+- **MCP** — connect any MCP server (local stdio or remote HTTP), use its tools
   like local ones via `MCPClient` + `ToolRegistry.aregister_mcp`.
 
 **Switch platforms by changing 3 params**: `base_url` + `api_key` + `model`.
@@ -113,7 +113,9 @@ llm = LLM(base_url=..., api_key=..., model=..., max_retries=3)  # auto-retry
 
 ### MCP integration
 
-Connect any MCP server and use its tools like local ones. Requires `pip install mcp>=1.2`.
+Connect any MCP server (local subprocess via **stdio**, or remote via
+**Streamable HTTP**) and use its tools like local ones. Requires
+`pip install mcp>=1.2`.
 
 ```python
 import asyncio
@@ -124,14 +126,11 @@ async def main():
     llm = LLM(base_url=..., api_key=..., model="...")
     tools = ToolRegistry()
 
-    # Connect an MCP server (e.g. official filesystem server, needs node/npx)
+    # Local server via stdio (e.g. official filesystem server, needs node/npx)
     async with MCPClient.from_command(
         ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/data"]
     ) as mcp:
-        # Register ALL tools from the server, zero config
-        await tools.aregister_mcp(mcp)
-
-        # Agent uses MCP tools seamlessly (must use ainvoke — MCP is async)
+        await tools.aregister_mcp(mcp)          # register ALL server tools
         agent = Agent(llm=llm, tools=tools, system_prompt="你是助手")
         answer = await agent.ainvoke("读取 /data/report.md 并总结")
         print(answer)
@@ -139,9 +138,19 @@ async def main():
 asyncio.run(main())
 ```
 
+Remote server via Streamable HTTP (e.g. Tavily search):
+
+```python
+async with MCPClient.from_url("https://mcp.tavily.com/mcp/?tavilyApiKey=...") as mcp:
+    await tools.aregister_mcp(mcp)
+    answer = await agent.ainvoke("2025 最新 Python 版本是什么？检索后回答")
+```
+
 `MCPClient` is a thin adapter over the official `mcp` SDK (protocol/transport
-fully reused — we only bridge tool representation and result flattening). MCP
-tools are async-only (use `Agent.ainvoke` / `astream`).
+fully reused — we only bridge tool representation and result flattening).
+Both `from_command` (stdio) and `from_url` (Streamable HTTP) return an async
+context manager that **must** be used with `async with`. MCP tools are
+async-only (use `Agent.ainvoke` / `astream`).
 
 ### Run the example
 
@@ -157,6 +166,7 @@ agent.py    ← Agent (invoke/ainvoke/stream/astream) — orchestration
 llm.py      ← LLM (invoke/ainvoke/stream/astream) — foundation, built-in retry
 tools.py    ← Tool/ToolRegistry (sync execute + async aexecute) — capability
 mcp.py      ← MCPClient/MCPTool (optional, needs mcp SDK) — MCP adapter
+             (stdio + Streamable HTTP transports)
 messages.py ← Message/Role/ToolCall/StreamEvent — data models (leaf)
 ```
 
@@ -181,7 +191,7 @@ LLM invoke → parse tool_calls → execute tools → append tool results → re
 ## Tests
 
 ```bash
-pytest tests/        # 101 tests, no API key / network needed (mock LLM)
+pytest tests/        # 105 tests, no API key / network needed (mock LLM)
 ```
 
 ## Tech Stack

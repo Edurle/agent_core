@@ -290,3 +290,164 @@ class TestAgentWithMCP:
         result = await agent.ainvoke("读一下 /data/x.md")
         assert result == "文件内容是 hello world"
         assert llm.call_count == 2
+
+
+# ═══════════════════════════════════════════════════════════
+#  Streamable HTTP transport（from_url）
+# ═══════════════════════════════════════════════════════════
+
+
+def _make_fake_stream_cm(read, write, session_id_cb=lambda: None):
+    """构造模拟 SDK 的 streamablehttp_client 返回的 async context manager。
+
+    SDK 返回三元组 (read, write, get_session_id)，本测试验证适配层正确解包。
+    """
+    from types import SimpleNamespace
+
+    class _CM:
+        def __init__(self):
+            self.entered = False
+            self.exited = False
+
+        async def __aenter__(self):
+            self.entered = True
+            return (read, write, session_id_cb)
+
+        async def __aexit__(self, *exc):
+            self.exited = True
+
+    return _CM()
+
+
+class _FakeClientSession:
+    """模拟 mcp.ClientSession 的 async context manager。"""
+
+    def __init__(self, tools_result, call_result=None):
+        self._tools_result = tools_result
+        self._call_result = call_result
+        self.initialized = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        pass
+
+    async def initialize(self):
+        self.initialized = True
+
+    async def list_tools(self):
+        return self._tools_result
+
+    async def call_tool(self, name, arguments):
+        return self._call_result
+
+
+class TestStreamableHTTPTransport:
+    """验证 _StreamableHTTPTransport 与 from_url 的适配。
+
+    通过 monkeypatch 替换 SDK 的 streamablehttp_client 和 ClientSession，
+    不依赖真实网络。
+    """
+
+    @pytest.mark.asyncio
+    async def test_from_url_unpacks_three_tuple(self, monkeypatch):
+        """HTTP transport 应正确解包 SDK 的 (read, write, get_session_id) 三元组，
+        丢弃第三个元素。"""
+        import agent_core.mcp as mcp_mod
+
+        captured = {}
+        read, write = object(), object()  # 哨兵对象，验证透传
+        session_cb = lambda: "session-123"
+
+        def fake_streamablehttp_client(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return _make_fake_stream_cm(read, write, session_cb)
+
+        # 替换 SDK 函数
+        import mcp.client.streamable_http as sh_mod
+        monkeypatch.setattr(sh_mod, "streamablehttp_client", fake_streamablehttp_client)
+
+        # 替换 ClientSession 为 fake（含一个工具）
+        fake_session = _FakeClientSession(
+            tools_result=SimpleNamespace(tools=[
+                make_sdk_tool("search", "检索", {"type": "object"}),
+            ])
+        )
+        import mcp as mcp_pkg
+        monkeypatch.setattr(mcp_pkg, "ClientSession", lambda r, w: fake_session)
+
+        # 用 from_url 建连
+        async with MCPClient.from_url(
+            "https://mcp.example.com/mcp", headers={"X-Test": "1"}, timeout=10
+        ) as mcp:
+            # 传给 SDK 的参数正确
+            assert captured["url"] == "https://mcp.example.com/mcp"
+            assert captured["kwargs"]["headers"] == {"X-Test": "1"}
+            assert captured["kwargs"]["timeout"] == 10
+            # session 已初始化
+            assert fake_session.initialized
+            # 能发现工具
+            tools = await mcp.list_tools()
+            assert len(tools) == 1
+            assert tools[0].name == "search"
+
+    @pytest.mark.asyncio
+    async def test_from_url_call_tool(self, monkeypatch):
+        """from_url 建连后能 call_tool。"""
+        import agent_core.mcp as mcp_mod
+        from types import SimpleNamespace
+
+        read, write = object(), object()
+
+        def fake_streamablehttp_client(url, **kwargs):
+            return _make_fake_stream_cm(read, write)
+
+        import mcp.client.streamable_http as sh_mod
+        monkeypatch.setattr(sh_mod, "streamablehttp_client", fake_streamablehttp_client)
+
+        fake_session = _FakeClientSession(
+            tools_result=SimpleNamespace(tools=[make_sdk_tool("search", "检索", {})]),
+            call_result=SimpleNamespace(
+                content=[make_text_content("检索结果：Python 3.14")],
+                isError=False,
+            ),
+        )
+        import mcp as mcp_pkg
+        monkeypatch.setattr(mcp_pkg, "ClientSession", lambda r, w: fake_session)
+
+        async with MCPClient.from_url("https://mcp.example.com/mcp") as mcp:
+            result = await mcp.call_tool("search", {"query": "python"})
+            assert result == "检索结果：Python 3.14"
+
+    def test_from_url_returns_connection(self):
+        """from_url 应返回 _MCPConnection（async context manager）。"""
+        conn = MCPClient.from_url("https://example.com/mcp")
+        # 是 async context manager（有 __aenter__/__aexit__）
+        assert hasattr(conn, "__aenter__")
+        assert hasattr(conn, "__aexit__")
+        # 没有 __await__（强制 async with，防止误用裸 await）
+        assert not hasattr(conn, "__await__")
+
+    @pytest.mark.asyncio
+    async def test_transport_exit_called_on_context_exit(self, monkeypatch):
+        """async with 退出时应关闭 transport。"""
+        from types import SimpleNamespace
+
+        stream_cm = _make_fake_stream_cm(object(), object())
+
+        def fake_streamablehttp_client(url, **kwargs):
+            return stream_cm
+
+        import mcp.client.streamable_http as sh_mod
+        monkeypatch.setattr(sh_mod, "streamablehttp_client", fake_streamablehttp_client)
+        monkeypatch.setattr(
+            "mcp.ClientSession",
+            lambda r, w: _FakeClientSession(SimpleNamespace(tools=[])),
+        )
+
+        async with MCPClient.from_url("https://example.com/mcp"):
+            pass
+        # 退出后 transport 的 context 已关闭
+        assert stream_cm.exited is True
